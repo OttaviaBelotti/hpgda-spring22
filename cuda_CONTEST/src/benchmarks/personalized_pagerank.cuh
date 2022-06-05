@@ -137,8 +137,22 @@ class PersonalizedPageRank : public Benchmark {
     std::vector<int> x;       // Source coordinate of edges in graph;
     std::vector<int> y;       // Destination coordinate of edges in graph;
     std::vector<double> val;  // Used for matrix value, initially all values are 1;
+
+    // COO format for GPU
+    int *x_d;               // Source coordinate of edges in graph -- GPU
+    int *y_d;               // Destination coordinate of edges in graph -- GPU
+    double *val_d;          // Used for matrix value -- GPU
+    double *pr_gpu;         // Store computation intermediate + final results -- GPU
+    double *gpu_result;     // result of kernel function -- GPU
+
+    int number_of_iterations = 1;
+    int BLOCKSIZE = 128;
+
     std::vector<int> dangling;
     std::vector<double> pr;   // Store here the PageRank values computed by the GPU;
+
+
+
     std::vector<double> pr_golden;  // PageRank values computed by the CPU;
     int personalization_vertex = 0;
     double convergence_threshold = DEFAULT_CONVERGENCE;
@@ -147,6 +161,10 @@ class PersonalizedPageRank : public Benchmark {
     int topk_vertices = 20;   // Number of highest-ranked vertices to look for;
     double precision = 0;     // How many top-20 vertices are correctly retrieved;
     std::string graph_file_path = DEFAULT_GRAPH;
+
+    int blockSize;      // The launch configurator returned block size 
+    int minGridSize;    // The minimum grid size needed to achieve the maximum occupancy for a full device launch 
+    int gridSize;       // The actual grid size needed, based on input size
 
     void initialize_graph();
 };

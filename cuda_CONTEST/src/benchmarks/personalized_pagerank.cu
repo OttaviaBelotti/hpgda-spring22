@@ -29,6 +29,9 @@
 
 #include <sstream>
 #include "personalized_pagerank.cuh"
+#include <iostream>
+#include <vector>
+#include <algorithm>
 
 namespace chrono = std::chrono;
 using clock_type = chrono::high_resolution_clock;
@@ -42,6 +45,26 @@ using clock_type = chrono::high_resolution_clock;
 //////////////////////////////
 
 // CPU Utility functions;
+
+#define CHECK(call)                                                                       \
+    {                                                                                     \
+        const cudaError_t err = call;                                                     \
+        if (err != cudaSuccess)                                                           \
+        {                                                                                 \
+            printf("%s in %s at line %d\n", cudaGetErrorString(err), __FILE__, __LINE__); \
+            exit(EXIT_FAILURE);                                                           \
+        }                                                                                 \
+    }
+
+#define CHECK_KERNELCALL()                                                                \
+    {                                                                                     \
+        const cudaError_t err = cudaGetLastError();                                       \
+        if (err != cudaSuccess)                                                           \
+        {                                                                                 \
+            printf("%s in %s at line %d\n", cudaGetErrorString(err), __FILE__, __LINE__); \
+            exit(EXIT_FAILURE);                                                           \
+        }                                                                                 \
+    }
 
 // Read the input graph and initialize it;
 void PersonalizedPageRank::initialize_graph() {
@@ -93,34 +116,128 @@ void PersonalizedPageRank::initialize_graph() {
 // Allocate data on the CPU and GPU;
 void PersonalizedPageRank::alloc() {
     // Load the input graph and preprocess it;
-    initialize_graph();
+    initialize_graph(); //CPU loading data
+
+    printf("CHECK COO FORMAT\n");
+    for(int i = 0; i < 6; i++){
+        printf("%d -> x: %d, y: %d, val: %lf\n", i, x[i], y[i], val[i]);
+    }
 
     // Allocate any GPU data here;
     // TODO!
+   
+    // Allocate GPU data: cloning x, y and val vectors in GPU global memory
+    CHECK(cudaMalloc(&x_d, sizeof(int)*E));
+    CHECK(cudaMalloc(&y_d, sizeof(int)*E));
+    CHECK(cudaMalloc(&val_d, sizeof(double)*E));
+    CHECK(cudaMalloc(&pr_gpu, sizeof(double)*V));  
+    CHECK(cudaMalloc(&gpu_result, sizeof(double)*V));
+
+    CHECK(cudaMemcpy(x_d, &x[0], sizeof(int) * x.size(), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(y_d, &y[0], sizeof(int) * y.size(), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(val_d, &val[0], sizeof(double) * val.size(), cudaMemcpyHostToDevice));
+    
 }
 
 // Initialize data;
 void PersonalizedPageRank::init() {
     // Do any additional CPU or GPU setup here;
     // TODO!
+
 }
 
 // Reset the state of the computation after every iteration.
 // Reset the result, and transfer data to the GPU if necessary;
 void PersonalizedPageRank::reset() {
-   // Reset the PageRank vector (uniform initialization, 1 / V for each vertex);
-   std::fill(pr.begin(), pr.end(), 1.0 / V); 
-   // Generate a new personalization vertex for this iteration;
-   personalization_vertex = rand() % V; 
-   if (debug) std::cout << "personalization vertex=" << personalization_vertex << std::endl;
+    // Reset the PageRank vector (uniform initialization, 1 / V for each vertex);
+    std::fill(pr.begin(), pr.end(), 1.0 / V); 
+    // Generate a new personalization vertex for this iteration;
+    personalization_vertex = rand() % V; 
+    if (debug) std::cout << "personalization vertex=" << personalization_vertex << std::endl;
 
-   // Do any GPU reset here, and also transfer data to the GPU;
-   // TODO!
+    cudaMemcpy(pr_gpu, &pr[0], sizeof(double) * pr.size(), cudaMemcpyHostToDevice);
+
+    // initialize GPU result array with all 0s
+    cudaMemset(gpu_result, 0.0, sizeof(double)*V);
+
+    // Do any GPU reset here, and also transfer data to the GPU;
+    // TODO!
+
 }
+
+
+
+__global__ void spmv_coo(const int *x, const int *y, const double *val, const double *vec, double *result, int N) {
+    for (int i = 0; i < N; i++) {
+        result[x[i]] += val[i] * vec[y[i]];
+    }
+}
+
+__global__ void spmv_coo_v2(const int *x, const int *y, const double *val, const double *vec, double *result, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i < N){
+        atomicAdd(result + x[i], val[i] * vec[y[i]]);
+    }
+}
+
+__global__ void spmv_coo_v3(const int num_vals, int *row_ids, int *col_ids, double *values, int num_rows, double *x, double *y) {
+    
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_rows; i += blockDim.x * gridDim.x) {
+        if(i < num_vals){
+            atomicAdd(y+row_ids[i], values[i]*x[col_ids[i]]);
+        }
+    }
+}
+
+__global__ void spmv_coo_final(const int *x, const int *y, const double *val, const double *vec, double *result, int N) {
+    // Uses a grid-stride loop to perform dot product
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += blockDim.x * gridDim.x) {
+        atomicAdd(result + x[i], val[i] * vec[y[i]]);
+    }
+}
+
+struct greater
+{
+    template<class T>
+    bool operator()(T const &a, T const &b) const { return a > b; }
+};
 
 void PersonalizedPageRank::execute(int iter) {
     // Do the GPU computation here, and also transfer results to the CPU;
     //TODO! (and save the GPU PPR values into the "pr" array)
+
+    // int n_threads_per_block = 32; //do not use less then 32 (1 warp), but no more than 1024
+    // int n_blocks = 32;
+
+    // execute_gpu<<<n_blocks, n_threads_per_block>>>()
+    /*
+    printf("CHECK COPY\n");
+    for(int i = 0; i < 6; i++){
+        printf("%d -> temp_x: %d, temp_y: %d, temp_val: %lf, temp_pr: %lf\n", i, temp_x[i], temp_y[i], temp_val[i], temp_pr[i]);
+    }
+    */
+
+    dim3 blocksPerGrid((E + BLOCKSIZE - 1)/BLOCKSIZE, 1, 1);
+    dim3 threadsPerBlock(BLOCKSIZE, 1, 1);
+
+    for(int i = 0; i < number_of_iterations; i++){
+        //spmv_coo_v2<<<1, 32>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E);
+        //spmv_coo_v2<<<blocksPerGrid, threadsPerBlock>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E);
+        spmv_coo_final<<<blocksPerGrid, threadsPerBlock>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E);
+        
+        CHECK_KERNELCALL();
+        CHECK(cudaDeviceSynchronize());
+        //cudaMemcpy(pr_gpu, gpu_result, sizeof(double) * pr.size(), cudaMemcpyDeviceToDevice);
+        //cudaMemset(gpu_result, 0.0, sizeof(double) * pr.size());
+    }
+
+
+    CHECK(cudaMemcpy(&pr[0], gpu_result, sizeof(double) * V, cudaMemcpyDeviceToHost));
+    std::sort(pr.begin(), pr.end(), greater());
+    printf("FINAL PR\n");
+    for(int i = 0; i < 6; i++){
+        printf("%d -> val: %lf\n", i, pr[i]);
+    }
 }
 
 void PersonalizedPageRank::cpu_validation(int iter) {
@@ -187,4 +304,10 @@ std::string PersonalizedPageRank::print_result(bool short_form) {
 void PersonalizedPageRank::clean() {
     // Delete any GPU data or additional CPU data;
     // TODO!
+    
+    cudaFree(x_d);
+    cudaFree(y_d);
+    cudaFree(val_d);
+    cudaFree(pr_gpu);
+    cudaFree(gpu_result);
 }
