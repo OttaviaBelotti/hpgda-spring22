@@ -145,7 +145,11 @@ class PersonalizedPageRank : public Benchmark {
     double *pr_gpu;         // Store computation intermediate + final results -- GPU
     double *gpu_result;     // result of kernel function -- GPU
 
-    int number_of_iterations = 1;
+    // dangling GPU
+    double *dangling_factor_gpu;
+    int *dangling_bitmap;
+
+    int number_of_iterations = 5;
     int BLOCKSIZE = 128;
 
     std::vector<int> dangling;

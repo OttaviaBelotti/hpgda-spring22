@@ -143,6 +143,9 @@ void PersonalizedPageRank::alloc() {
 void PersonalizedPageRank::init() {
     // Do any additional CPU or GPU setup here;
     // TODO!
+    cudaMalloc(&dangling_factor_gpu, sizeof(double));
+    cudaMalloc(&dangling_bitmap, sizeof(int)*dangling.size());
+    cudaMemcpy(dangling_bitmap, dangling.data(), sizeof(int)*dangling.size(), cudaMemcpyHostToDevice);
 
 }
 
@@ -189,10 +192,44 @@ __global__ void spmv_coo_v3(const int num_vals, int *row_ids, int *col_ids, doub
     }
 }
 
-__global__ void spmv_coo_final(const int *x, const int *y, const double *val, const double *vec, double *result, int N) {
+__global__ void spmv_coo_final(const int *x, const int *y, const double *val, const double *vec, double *result, int N, int iter) {
     // Uses a grid-stride loop to perform dot product
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += blockDim.x * gridDim.x) {
         atomicAdd(result + x[i], val[i] * vec[y[i]]);
+    }
+}
+
+__global__ void compute_dangling_factor_gpu(const int *a, const double *b, const int N, double *result){
+    //is it convinient to compute it like this? It should be an accumulation
+    __shared__ double temp_res;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if(i == 0)
+        temp_res = 0.0;
+    
+    __syncthreads();
+    
+    for(; i < N; i += blockDim.x * gridDim.x){
+        atomicAdd(&temp_res, a[i] * b[i]);
+    }
+
+    //let the first thread handle the storing of the result back in the pointer
+    if(blockIdx.x * blockDim.x + threadIdx.x == 0)
+        *result = temp_res;
+
+}
+
+__global__ void axpb_personalized_gpu(double alpha, double *x, double beta, const int personalization_vertex, double *result, const int N){
+    __shared__ double one_minus_alpha;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if(i == 0)
+        one_minus_alpha = 1 - alpha;
+    
+    __syncthreads();
+
+    for(; i < N; i+= blockDim.x * gridDim.x){
+        result[i] = alpha * x[i] + beta + (personalization_vertex == i ? one_minus_alpha : 0.0);
     }
 }
 
@@ -219,25 +256,46 @@ void PersonalizedPageRank::execute(int iter) {
 
     dim3 blocksPerGrid((E + BLOCKSIZE - 1)/BLOCKSIZE, 1, 1);
     dim3 threadsPerBlock(BLOCKSIZE, 1, 1);
+    double *temp;
+    double dangling_factor_val;
 
-    for(int i = 0; i < number_of_iterations; i++){
+
+    for(int i = 0; i < number_of_iterations && i < max_iterations; i++){
         //spmv_coo_v2<<<1, 32>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E);
         //spmv_coo_v2<<<blocksPerGrid, threadsPerBlock>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E);
-        spmv_coo_final<<<blocksPerGrid, threadsPerBlock>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E);
+        spmv_coo_final<<<blocksPerGrid, threadsPerBlock>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E, i);
+
+        CHECK_KERNELCALL();
+        CHECK(cudaDeviceSynchronize());
+
+        compute_dangling_factor_gpu<<<blocksPerGrid, threadsPerBlock>>>(dangling_bitmap, gpu_result, V, dangling_factor_gpu);
+
+        CHECK_KERNELCALL();
+        CHECK(cudaDeviceSynchronize());
+
+        cudaMemcpy(&dangling_factor_val, dangling_factor_gpu, sizeof(double), cudaMemcpyDeviceToHost);
+
+        axpb_personalized_gpu<<<blocksPerGrid, threadsPerBlock>>>(DEFAULT_ALPHA, gpu_result, DEFAULT_ALPHA * dangling_factor_val / V, personalization_vertex, gpu_result, V );
         
         CHECK_KERNELCALL();
         CHECK(cudaDeviceSynchronize());
+
+        temp = pr_gpu;
+        pr_gpu = gpu_result;
+        gpu_result = temp;
         //cudaMemcpy(pr_gpu, gpu_result, sizeof(double) * pr.size(), cudaMemcpyDeviceToDevice);
-        //cudaMemset(gpu_result, 0.0, sizeof(double) * pr.size());
+        cudaMemset(gpu_result, 0.0, sizeof(double) * V);   
+
+        CHECK(cudaMemcpy(&pr[0], pr_gpu, sizeof(double) * V, cudaMemcpyDeviceToHost));
+        //std::sort(pr.begin(), pr.end(), greater());
+        printf("FINAL PR\n");
+        for(int i = 0; i < 6; i++){
+            printf("%d -> val: %lf\n", i, pr[i]);
+        }
     }
 
 
-    CHECK(cudaMemcpy(&pr[0], gpu_result, sizeof(double) * V, cudaMemcpyDeviceToHost));
-    std::sort(pr.begin(), pr.end(), greater());
-    printf("FINAL PR\n");
-    for(int i = 0; i < 6; i++){
-        printf("%d -> val: %lf\n", i, pr[i]);
-    }
+    
 }
 
 void PersonalizedPageRank::cpu_validation(int iter) {
