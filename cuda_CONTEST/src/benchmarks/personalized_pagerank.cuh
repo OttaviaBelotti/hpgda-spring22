@@ -138,7 +138,7 @@ class PersonalizedPageRank : public Benchmark {
     std::vector<int> y;       // Destination coordinate of edges in graph;
     std::vector<double> val;  // Used for matrix value, initially all values are 1;
 
-    // COO format for GPU
+    // COO format GPU
     int *x_d;               // Source coordinate of edges in graph -- GPU
     int *y_d;               // Destination coordinate of edges in graph -- GPU
     double *val_d;          // Used for matrix value -- GPU
@@ -149,8 +149,8 @@ class PersonalizedPageRank : public Benchmark {
     double *dangling_factor_gpu;
     int *dangling_bitmap;
 
-    int number_of_iterations = 5;
-    int BLOCKSIZE = 128;
+    // convergence error GPU
+    double *gpu_err;        // GPU error used to measure convergence
 
     std::vector<int> dangling;
     std::vector<double> pr;   // Store here the PageRank values computed by the GPU;
@@ -162,13 +162,10 @@ class PersonalizedPageRank : public Benchmark {
     double convergence_threshold = DEFAULT_CONVERGENCE;
     double alpha = DEFAULT_ALPHA;
     int max_iterations = DEFAULT_MAX_ITER;
+    int blocksize = 256;
     int topk_vertices = 20;   // Number of highest-ranked vertices to look for;
     double precision = 0;     // How many top-20 vertices are correctly retrieved;
     std::string graph_file_path = DEFAULT_GRAPH;
-
-    int blockSize;      // The launch configurator returned block size 
-    int minGridSize;    // The minimum grid size needed to achieve the maximum occupancy for a full device launch 
-    int gridSize;       // The actual grid size needed, based on input size
 
     void initialize_graph();
 };
