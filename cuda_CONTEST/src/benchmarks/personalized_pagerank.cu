@@ -41,6 +41,32 @@ using clock_type = chrono::high_resolution_clock;
 
 // Write GPU kernel here!
 
+/**
+ * @brief Parallel GPU version of matrix-vector multiplication.
+ * 
+ * @param x row indices (COO format matrix - vector)
+ * @param y column indices (COO format matrix - vector)
+ * @param val matrix values (COO format matrix - vector)
+ * @param vec vector
+ * @param result vector for result of the multiplication
+ * @param N vector dimension
+ */
+__global__ void spmv_coo_0(const int *x, const int *y, const double *val, const double *vec, double *result, int N) {
+    // Uses a grid-stride loop to perform dot product
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += blockDim.x * gridDim.x) {
+        atomicAdd(result + x[i], val[i] * vec[y[i]]);
+    }
+}
+
+__global__ void spmv_coo_temp(const int num_vals, int *row_ids, int *col_ids, double *values, int num_rows, double *x, double *y) {
+    
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_rows; i += blockDim.x * gridDim.x) {
+        if(i < num_vals){
+            atomicAdd(y+row_ids[i], values[i]*x[col_ids[i]]);
+        }
+    }
+}
+
 //////////////////////////////
 //////////////////////////////
 
@@ -118,14 +144,9 @@ void PersonalizedPageRank::alloc() {
     // Load the input graph and preprocess it;
     initialize_graph(); //CPU loading data
 
-    printf("CHECK COO FORMAT\n");
-    for(int i = 0; i < 6; i++){
-        printf("%d -> x: %d, y: %d, val: %lf\n", i, x[i], y[i], val[i]);
-    }
-
     // Allocate any GPU data here;
     // TODO!
-   
+
     // Allocate GPU data: cloning x, y and val vectors in GPU global memory
     CHECK(cudaMalloc(&x_d, sizeof(int)*E));
     CHECK(cudaMalloc(&y_d, sizeof(int)*E));
@@ -133,6 +154,8 @@ void PersonalizedPageRank::alloc() {
     CHECK(cudaMalloc(&pr_gpu, sizeof(double)*V));  
     CHECK(cudaMalloc(&gpu_result, sizeof(double)*V));
     CHECK(cudaMalloc(&gpu_err, sizeof(double)));
+    CHECK(cudaMalloc(&dangling_factor_gpu, sizeof(double)));
+    CHECK(cudaMalloc(&dangling_bitmap, sizeof(int)*dangling.size()));
 
     CHECK(cudaMemcpy(x_d, &x[0], sizeof(int) * x.size(), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(y_d, &y[0], sizeof(int) * y.size(), cudaMemcpyHostToDevice));
@@ -144,9 +167,6 @@ void PersonalizedPageRank::alloc() {
 void PersonalizedPageRank::init() {
     // Do any additional CPU or GPU setup here;
     // TODO!
-    CHECK(cudaMalloc(&dangling_factor_gpu, sizeof(double)));
-    CHECK(cudaMalloc(&dangling_bitmap, sizeof(int)*dangling.size()));
-
 }
 
 // Reset the state of the computation after every iteration.
@@ -158,14 +178,12 @@ void PersonalizedPageRank::reset() {
     personalization_vertex = rand() % V; 
     if (debug) std::cout << "personalization vertex=" << personalization_vertex << std::endl;
 
-    CHECK(cudaMemcpy(pr_gpu, &pr[0], sizeof(double) * pr.size(), cudaMemcpyHostToDevice));
-
-    // initialize GPU result array with all 0s
-    CHECK(cudaMemset(gpu_result, 0.0, sizeof(double)*V));
-
     // Do any GPU reset here, and also transfer data to the GPU;
     // TODO!
 
+    CHECK(cudaMemcpy(pr_gpu, &pr[0], sizeof(double) * pr.size(), cudaMemcpyHostToDevice));
+    // initialize GPU result array with all 0s
+    CHECK(cudaMemset(gpu_result, 0.0, sizeof(double)*V));
     CHECK(cudaMemcpy(dangling_bitmap, dangling.data(), sizeof(int)*dangling.size(), cudaMemcpyHostToDevice));
 
     //compute the out_degree and the in_degree of the personalization_vertex
@@ -186,32 +204,6 @@ void PersonalizedPageRank::reset() {
     printf("custom alpha: %lf\n", custom_alpha);
 }
 
-
-__global__ void spmv_coo_v3(const int num_vals, int *row_ids, int *col_ids, double *values, int num_rows, double *x, double *y) {
-    
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_rows; i += blockDim.x * gridDim.x) {
-        if(i < num_vals){
-            atomicAdd(y+row_ids[i], values[i]*x[col_ids[i]]);
-        }
-    }
-}
-
-/**
- * @brief Parallel GPU version of matrix-vector multiplication.
- * 
- * @param x row indices (COO format matrix - vector)
- * @param y column indices (COO format matrix - vector)
- * @param val matrix values (COO format matrix - vector)
- * @param vec vector
- * @param result vector for result of the multiplication
- * @param N vector dimension
- */
-__global__ void spmv_coo_final(const int *x, const int *y, const double *val, const double *vec, double *result, int N) {
-    // Uses a grid-stride loop to perform dot product
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += blockDim.x * gridDim.x) {
-        atomicAdd(result + x[i], val[i] * vec[y[i]]);
-    }
-}
 
 /**
  * @brief Computation for the dangling factor.
@@ -271,7 +263,7 @@ __global__ void axpb_personalized_gpu_v2(double alpha, double *x, int *dang_vect
  * @brief GPU parallelized version for euclidean distance
  * 
  * @param x vector of x (row) coordinates
- * @param y vecotr of y (column) coordinates
+ * @param y vector of y (column) coordinates
  * @param N dimension of the vectors
  * @param result pointer to the computed distance result
  */
@@ -283,28 +275,28 @@ __global__ void euclidean_distance_gpu(const double *x, const double *y, const i
     }
 }
 
-void PersonalizedPageRank::execute(int iter) {
-    // Do the GPU computation here, and also transfer results to the CPU;
+void PersonalizedPageRank::personalized_pagerank_0(int iter){
+    auto start_tmp = clock_type::now();
 
     dim3 blocksPerGrid((E + blocksize - 1) / blocksize, 1, 1);
     dim3 threadsPerBlock(blocksize, 1, 1);
-    
+
     double *temp;
     double dangling_factor_val;
     double *prev_pr = (double *) malloc(sizeof(double) * V); // previous values of pr
     double *curr_pr = (double *) malloc(sizeof(double) * V); // current values of pr
     double *err = (double *) malloc(sizeof(double));         // convergence error
 
-    printf("blocksPerGrid: %d\tthreadsPerBlock:%d\n", (E + blocksize - 1) / blocksize, blocksize);
+    //printf("blocksPerGrid: %d\tthreadsPerBlock:%d\n", (E + blocksize - 1) / blocksize, blocksize);
 
     int number_of_iterations = 0;
     bool conv = false;
     while (!conv && number_of_iterations < DEFAULT_MAX_ITER) {
         CHECK(cudaMemset(gpu_err, 0.0, sizeof(double)));           // reset error 
         CHECK(cudaMemset(gpu_result, 0.0, sizeof(double) * V));    // reset GPU result
-        cudaMemset(dangling_factor_gpu, 0.0, sizeof(double));  //reset dangling factor
+        cudaMemset(dangling_factor_gpu, 0.0, sizeof(double));      // reset dangling factor
 
-        spmv_coo_final<<<blocksPerGrid, threadsPerBlock>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E);
+        spmv_coo_0<<<blocksPerGrid, threadsPerBlock>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E);
         CHECK_KERNELCALL();
         CHECK(cudaDeviceSynchronize());
 
@@ -334,12 +326,31 @@ void PersonalizedPageRank::execute(int iter) {
         number_of_iterations++;
     }
 
+    if (debug) {
+        // Synchronize computation by hand to measure GPU exec. time;
+        auto end_tmp = clock_type::now();
+        auto exec_time = chrono::duration_cast<chrono::microseconds>(end_tmp - start_tmp).count();
+        std::cout << "  pure GPU execution(" << iter << ")=" << double(exec_time) / 1000 << " ms, " << (3 * sizeof(double) * N * N / (exec_time * 1e3)) << " GB/s" << std::endl;
+    }
+
     // save the GPU PPR values into the "pr" array
-        CHECK(cudaMemcpy(&pr[0], pr_gpu, sizeof(double) * V, cudaMemcpyDeviceToHost));
-    //printf("NUMBER OF GPU ITERATIONS: %d\n", number_of_iterations);
+    CHECK(cudaMemcpy(&pr[0], pr_gpu, sizeof(double) * V, cudaMemcpyDeviceToHost));
+
     free(prev_pr);
     free(curr_pr);
     free(err);
+}
+
+void PersonalizedPageRank::execute(int iter) {
+    // Do the GPU computation here, and also transfer results to the CPU;
+    switch (implementation)
+    {
+    case 0:
+        personalized_pagerank_0(iter);
+        break;
+    default:
+        break;
+    }
 }
 
 void PersonalizedPageRank::cpu_validation(int iter) {

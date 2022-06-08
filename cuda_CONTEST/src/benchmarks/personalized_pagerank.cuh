@@ -171,4 +171,5 @@ class PersonalizedPageRank : public Benchmark {
     std::string graph_file_path = DEFAULT_GRAPH;
 
     void initialize_graph();
+    void personalized_pagerank_0(int iter);
 };
