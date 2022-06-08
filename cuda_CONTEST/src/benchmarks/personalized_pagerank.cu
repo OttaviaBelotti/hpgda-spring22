@@ -168,6 +168,22 @@ void PersonalizedPageRank::reset() {
 
     CHECK(cudaMemcpy(dangling_bitmap, dangling.data(), sizeof(int)*dangling.size(), cudaMemcpyHostToDevice));
 
+    //compute the out_degree and the in_degree of the personalization_vertex
+    int in_degree = 0, out_degree = 0;
+    for(int i=0; i < E; i++){
+        if(x[i] == personalization_vertex)
+            in_degree++; //because in COO we have row/cols transposed
+        if(y[i] == personalization_vertex)
+            out_degree++;
+    }
+    printf("in_degree: %d\tout_degree: %d\n", in_degree, out_degree);
+
+    //if the personalization vector is lowly connected, then we lower the alpha
+    // if(in_degree < 0.001*V || out_degree < 0.001*V)
+    //     custom_alpha = 0.25;
+    // else
+    //     custom_alpha = DEFAULT_ALPHA;
+    printf("custom alpha: %lf\n", custom_alpha);
 }
 
 
@@ -206,37 +222,38 @@ __global__ void spmv_coo_final(const int *x, const int *y, const double *val, co
  * @param result pointer to the dangling factor (where to place the result of the function)
  */
 __global__ void compute_dangling_factor_gpu(const int *a, const double *b, const int N, double *result){
-    //is it convenient to compute it like this? It should be an accumulation
-    __shared__ double temp_res;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    if(i == 0)
-        temp_res = 0.0;
-    
-    __syncthreads();
-    
-    for(; i < N; i += blockDim.x * gridDim.x){
-        atomicAdd(&temp_res, a[i] * b[i]);
+    // using a share temp_result might speed up but we have problems in sync. the blocks
+
+    for(int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += blockDim.x * gridDim.x){
+        atomicAdd(result, a[i] * b[i]);
     }
-
-    __syncthreads();
-
-    //let the first thread handle the storing of the result back in the pointer
-    if(blockIdx.x * blockDim.x + threadIdx.x == 0)
-        *result = temp_res;
-
 }
 
 /**
  * @brief Final formula for PR
  * 
- * @param alpha
+ * @param alpha damping factor
  * @param x vector of intermediate pr values
- * @param beta alpha * dangling_factor / V
+ * @param beta damping factor: alpha * damping_factor / V
  * @param result final vector of the PR value results
  * @param N vectors dimension
 */
 __global__ void axpb_personalized_gpu(double alpha, double *x, double beta, const int personalization_vertex, double *result, const int N){
+    __shared__ double one_minus_alpha;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if(threadIdx.x == 0)
+        one_minus_alpha = 1 - alpha;
+    
+    __syncthreads();
+
+    for(; i < N; i+= blockDim.x * gridDim.x){
+        result[i] = alpha * x[i] + beta + ((personalization_vertex == i) ? one_minus_alpha : 0.0);
+    }
+}
+
+
+__global__ void axpb_personalized_gpu_v2(double alpha, double *x, int *dang_vector, double beta, const int personalization_vertex, double *result, const int N){
     __shared__ double one_minus_alpha;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -246,7 +263,7 @@ __global__ void axpb_personalized_gpu(double alpha, double *x, double beta, cons
     __syncthreads();
 
     for(; i < N; i+= blockDim.x * gridDim.x){
-        result[i] = alpha * x[i] + beta + (personalization_vertex == i ? one_minus_alpha : 0.0);
+        result[i] = alpha * x[i] + beta * dang_vector[i] + ((personalization_vertex == i) ? one_minus_alpha : 0.0);
     }
 }
 
@@ -260,7 +277,7 @@ __global__ void axpb_personalized_gpu(double alpha, double *x, double beta, cons
  */
 __global__ void euclidean_distance_gpu(const double *x, const double *y, const int N, double *result) {
     //can be improved
-    
+
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += blockDim.x * gridDim.x) {
         atomicAdd(result, (x[i] - y[i]) * (x[i] - y[i]));
     }
@@ -285,21 +302,23 @@ void PersonalizedPageRank::execute(int iter) {
     while (!conv && number_of_iterations < DEFAULT_MAX_ITER) {
         CHECK(cudaMemset(gpu_err, 0.0, sizeof(double)));           // reset error 
         CHECK(cudaMemset(gpu_result, 0.0, sizeof(double) * V));    // reset GPU result
+        cudaMemset(dangling_factor_gpu, 0.0, sizeof(double));  //reset dangling factor
 
         spmv_coo_final<<<blocksPerGrid, threadsPerBlock>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E);
         CHECK_KERNELCALL();
         CHECK(cudaDeviceSynchronize());
 
-        compute_dangling_factor_gpu<<<blocksPerGrid, threadsPerBlock>>>(dangling_bitmap, gpu_result, V, dangling_factor_gpu);
+        compute_dangling_factor_gpu<<<blocksPerGrid, threadsPerBlock>>>(dangling_bitmap, pr_gpu, V, dangling_factor_gpu);
         CHECK_KERNELCALL();
         CHECK(cudaDeviceSynchronize());
 
         CHECK(cudaMemcpy(&dangling_factor_val, dangling_factor_gpu, sizeof(double), cudaMemcpyDeviceToHost));
 
-        axpb_personalized_gpu<<<blocksPerGrid, threadsPerBlock>>>(DEFAULT_ALPHA, gpu_result, DEFAULT_ALPHA * dangling_factor_val / V, personalization_vertex, gpu_result, V);
+        axpb_personalized_gpu<<<blocksPerGrid, threadsPerBlock>>>(custom_alpha, gpu_result, custom_alpha * dangling_factor_val / V, personalization_vertex, gpu_result, V);
         CHECK_KERNELCALL();
         CHECK(cudaDeviceSynchronize());
         
+        // Check convergence
         euclidean_distance_gpu<<<blocksPerGrid, threadsPerBlock>>>(pr_gpu, gpu_result, V, gpu_err);
         CHECK_KERNELCALL();
         CHECK(cudaDeviceSynchronize());
@@ -310,13 +329,13 @@ void PersonalizedPageRank::execute(int iter) {
 
         temp = pr_gpu;
         pr_gpu = gpu_result;
-        gpu_result = temp;
-        
-        // save the GPU PPR values into the "pr" array
-        CHECK(cudaMemcpy(&pr[0], pr_gpu, sizeof(double) * V, cudaMemcpyDeviceToHost));
+        gpu_result = temp; 
 
         number_of_iterations++;
     }
+
+    // save the GPU PPR values into the "pr" array
+        CHECK(cudaMemcpy(&pr[0], pr_gpu, sizeof(double) * V, cudaMemcpyDeviceToHost));
     //printf("NUMBER OF GPU ITERATIONS: %d\n", number_of_iterations);
     free(prev_pr);
     free(curr_pr);

@@ -149,6 +149,9 @@ class PersonalizedPageRank : public Benchmark {
     double *dangling_factor_gpu;
     int *dangling_bitmap;
 
+    //damping
+    double custom_alpha = DEFAULT_ALPHA; //the alpha we use depending on the personalization vertex of the iteration
+
     // convergence error GPU
     double *gpu_err;        // GPU error used to measure convergence
 
