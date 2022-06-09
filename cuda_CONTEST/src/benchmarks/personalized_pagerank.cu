@@ -186,6 +186,8 @@ void PersonalizedPageRank::reset() {
     CHECK(cudaMemset(gpu_result, 0.0, sizeof(double)*V));
     CHECK(cudaMemcpy(dangling_bitmap, dangling.data(), sizeof(int)*dangling.size(), cudaMemcpyHostToDevice));
 
+
+    // INFO at each iteration
     //compute the out_degree and the in_degree of the personalization_vertex
     int in_degree = 0, out_degree = 0;
     for(int i=0; i < E; i++){
@@ -244,21 +246,6 @@ __global__ void axpb_personalized_gpu(double alpha, double *x, double beta, cons
     }
 }
 
-
-__global__ void axpb_personalized_gpu_v2(double alpha, double *x, int *dang_vector, double beta, const int personalization_vertex, double *result, const int N){
-    __shared__ double one_minus_alpha;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if(i == 0)
-        one_minus_alpha = 1 - alpha;
-    
-    __syncthreads();
-
-    for(; i < N; i+= blockDim.x * gridDim.x){
-        result[i] = alpha * x[i] + beta * dang_vector[i] + ((personalization_vertex == i) ? one_minus_alpha : 0.0);
-    }
-}
-
 /**
  * @brief GPU parallelized version for euclidean distance
  * 
@@ -277,9 +264,21 @@ __global__ void euclidean_distance_gpu(const double *x, const double *y, const i
 
 void PersonalizedPageRank::personalized_pagerank_0(int iter){
     auto start_tmp = clock_type::now();
+ 
+    int blockSize = 1024; //max_capacity
+    int gridSize = (E + blockSize - 1) / blockSize;
 
-    dim3 blocksPerGrid((E + blocksize - 1) / blocksize, 1, 1);
-    dim3 threadsPerBlock(blocksize, 1, 1);
+    int blockSize_shared = 256;
+    int gridSize_shared = (V + blockSize_shared -1)/ blockSize_shared;
+
+    std::cout << "blockSize: " << blockSize << "\tgridSize: " << gridSize << std::endl;
+    std::cout << "blockSize_shared: " << blockSize_shared << "\tgridSize_shared: " << gridSize_shared << std::endl;
+
+    dim3 blocksPerGrid(gridSize, 1, 1);
+    dim3 threadsPerBlock(blockSize, 1, 1);
+
+    dim3 blocksPerGridShared(gridSize_shared, 1, 1);
+    dim3 threadsPerBlockShared(blockSize_shared, 1, 1);
 
     double *temp;
     double dangling_factor_val;
