@@ -265,7 +265,7 @@ __global__ void euclidean_distance_gpu(const double *x, const double *y, const i
 void PersonalizedPageRank::personalized_pagerank_0(int iter){
     auto start_tmp = clock_type::now();
  
-    int blockSize = 1024; //max_capacity
+    int blockSize = block_size; // take block size from option -t
     int gridSize = (E + blockSize - 1) / blockSize;
 
     int blockSize_shared = 256;
@@ -297,7 +297,7 @@ void PersonalizedPageRank::personalized_pagerank_0(int iter){
 
         spmv_coo_0<<<blocksPerGrid, threadsPerBlock>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E);
         CHECK_KERNELCALL();
-        CHECK(cudaDeviceSynchronize());
+        //CHECK(cudaDeviceSynchronize());
 
         compute_dangling_factor_gpu<<<blocksPerGrid, threadsPerBlock>>>(dangling_bitmap, pr_gpu, V, dangling_factor_gpu);
         CHECK_KERNELCALL();
