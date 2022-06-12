@@ -67,6 +67,28 @@ __global__ void spmv_coo_temp(const int num_vals, int *row_ids, int *col_ids, do
     }
 }
 
+__global__ void spmv_coo_1(const int *x, const int *y, const double *val, const double *vec, double *result, const int N, const int res_size){
+    extern __shared__ float temp_res[]; //must be initialized with N elements from the caller
+
+    for (int i = threadIdx.x; i < res_size; i += blockDim.x){ 
+        temp_res[i] = 0.0;
+    }
+
+    __syncthreads();
+
+    // Uses a grid-stride loop to perform dot product
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += blockDim.x * gridDim.x) {
+        atomicAdd_block(temp_res + x[i], (float)(val[i] * vec[y[i]])); //only thread-safe, not block-safe
+    }
+
+    __syncthreads();
+    //riassamble all the partial results: the speedup should be that we're doing num_blocks*V atomicAdd() instead of num_blocks*E atomicAdd()
+    for(int i=threadIdx.x; i < res_size; i += blockDim.x){
+        atomicAdd(&result[i], temp_res[i]);
+    }
+
+}
+
 //////////////////////////////
 //////////////////////////////
 
@@ -88,6 +110,7 @@ __global__ void spmv_coo_temp(const int num_vals, int *row_ids, int *col_ids, do
         if (err != cudaSuccess)                                                           \
         {                                                                                 \
             printf("%s in %s at line %d\n", cudaGetErrorString(err), __FILE__, __LINE__); \
+            printf("Err: %s\n", cudaGetErrorName(err));                                   \
             exit(EXIT_FAILURE);                                                           \
         }                                                                                 \
     }
@@ -295,7 +318,10 @@ void PersonalizedPageRank::personalized_pagerank_0(int iter){
         CHECK(cudaMemset(gpu_result, 0.0, sizeof(double) * V));    // reset GPU result
         cudaMemset(dangling_factor_gpu, 0.0, sizeof(double));      // reset dangling factor
 
-        spmv_coo_0<<<blocksPerGrid, threadsPerBlock>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E);
+        //spmv_coo_0<<<blocksPerGrid, threadsPerBlock>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E);
+        //cudaDeviceSetCacheConfig(cudaFuncCachePreferShared);
+        std::cout << "Requesting shared mem: " << V*sizeof(float)/1000 << "KB" << std::endl;
+        spmv_coo_1<<<blocksPerGrid, threadsPerBlock, V*sizeof(float)>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E, V);
         CHECK_KERNELCALL();
         //CHECK(cudaDeviceSynchronize());
 
