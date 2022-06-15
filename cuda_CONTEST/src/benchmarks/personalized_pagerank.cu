@@ -41,6 +41,53 @@ using clock_type = chrono::high_resolution_clock;
 
 // Write GPU kernel here!
 
+__inline__ __device__ void warp_reduction(volatile double *input, int threadId)
+// we need volatile flag here, otherwise the compiler might introduce some optimizations in the "input" variable
+// and place it in registers instead of shared memory!
+{
+	input[threadId] += input[threadId + 32];
+	input[threadId] += input[threadId + 16];
+	input[threadId] += input[threadId + 8];
+	input[threadId] += input[threadId + 4];
+	input[threadId] += input[threadId + 2];
+	input[threadId] += input[threadId + 1];
+}
+
+__device__ void collect_res_gpu(double *input, int numOfBlocks) // compute the final reduction
+{
+    int i, threadId = threadIdx.x;
+
+    /*
+    for (i = 0; i < numOfBlocks; i += blockDim.x) // collect the result of the various blocks
+    {
+        if ((threadId + i) * blockDim.x < numOfBlocks){
+            localVars[threadId] += input[(threadId + i) * blockDim.x];
+        }
+        __syncthreads();
+    }
+    */
+
+    for (i = blockDim.x / 2; i > 32; i >>= 1) // compute the parallel reduction for the collected data
+    {
+        if (threadId < i)
+        {
+            input[threadId] += input[threadId + i];
+        }
+        __syncthreads();
+    }
+
+    if(threadId<32)
+        warp_reduction(input,threadId);
+    __syncthreads();
+
+    /*
+    if(threadId==0)
+        input[threadId] = localVars[threadId];
+    __syncthreads();
+    */
+    
+}
+
 /**
  * @brief Parallel GPU version of matrix-vector multiplication.
  * 
@@ -277,11 +324,19 @@ __global__ void axpb_personalized_gpu(double alpha, double *x, double beta, cons
  * @param N dimension of the vectors
  * @param result pointer to the computed distance result
  */
-__global__ void euclidean_distance_gpu(const double *x, const double *y, const int N, double *result) {
-    //can be improved
-
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += blockDim.x * gridDim.x) {
-        atomicAdd(result, (x[i] - y[i]) * (x[i] - y[i]));
+__global__ void euclidean_distance_gpu(const double* x , const double* y , const int N, double* result) {
+    extern __shared__ double temp[];
+    double var;
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < N) {
+        var = x[idx] - y[idx];
+        temp[threadIdx.x] = var*var;
+    }
+    __syncthreads();
+    
+    collect_res_gpu(temp, blockDim.x);
+    if (threadIdx.x == 0) {
+        atomicAdd(result, temp[0]);
     }
 }
 
@@ -310,35 +365,45 @@ void PersonalizedPageRank::personalized_pagerank_0(int iter){
     double *err = (double *) malloc(sizeof(double));         // convergence error
 
     //printf("blocksPerGrid: %d\tthreadsPerBlock:%d\n", (E + blocksize - 1) / blocksize, blocksize);
+    cudaStream_t spmv_stream, dangling_factor_stream;
+    cudaStreamCreate(&spmv_stream);
+    cudaStreamCreate(&dangling_factor_stream);
 
     int number_of_iterations = 0;
     bool conv = false;
     while (!conv && number_of_iterations < DEFAULT_MAX_ITER) {
-        CHECK(cudaMemset(gpu_err, 0.0, sizeof(double)));           // reset error 
         CHECK(cudaMemset(gpu_result, 0.0, sizeof(double) * V));    // reset GPU result
-        cudaMemset(dangling_factor_gpu, 0.0, sizeof(double));      // reset dangling factor
 
-        //spmv_coo_0<<<blocksPerGrid, threadsPerBlock>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E);
-        //cudaDeviceSetCacheConfig(cudaFuncCachePreferShared);
-        std::cout << "Requesting shared mem: " << V*sizeof(float)/1000 << "KB" << std::endl;
-        spmv_coo_1<<<blocksPerGrid, threadsPerBlock, V*sizeof(float)>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E, V);
+        //CHECK(cudaMemsetAsync(dangling_factor_gpu, 0.0, sizeof(double), dangling_factor_stream));  
+        //CHECK(cudaMemset(gpu_err, 0.0, sizeof(double)));           // reset error 
+        //cudaMemset(dangling_factor_gpu, 0.0, sizeof(double));      // reset dangling factor
+
+        spmv_coo_0<<<blocksPerGrid, threadsPerBlock, 0 , spmv_stream>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E);
         CHECK_KERNELCALL();
         //CHECK(cudaDeviceSynchronize());
+        //cudaDeviceSetCacheConfig(cudaFuncCachePreferShared);
+        //std::cout << "Requesting shared mem: " << V*sizeof(float)/1000 << "KB" << std::endl;
+        //spmv_coo_1<<<blocksPerGrid, threadsPerBlock, V*sizeof(float)>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E, V);
 
-        compute_dangling_factor_gpu<<<blocksPerGrid, threadsPerBlock>>>(dangling_bitmap, pr_gpu, V, dangling_factor_gpu);
+        compute_dangling_factor_gpu<<<blocksPerGrid, threadsPerBlock, 0, dangling_factor_stream>>>(dangling_bitmap, pr_gpu, V, dangling_factor_gpu);
         CHECK_KERNELCALL();
-        CHECK(cudaDeviceSynchronize());
+        //CHECK(cudaDeviceSynchronize());
+        //cudaStreamSynchronize(spmv_stream);
+        //cudaStreamSynchronize(dangling_factor_stream);
 
         CHECK(cudaMemcpy(&dangling_factor_val, dangling_factor_gpu, sizeof(double), cudaMemcpyDeviceToHost));
 
         axpb_personalized_gpu<<<blocksPerGrid, threadsPerBlock>>>(custom_alpha, gpu_result, custom_alpha * dangling_factor_val / V, personalization_vertex, gpu_result, V);
         CHECK_KERNELCALL();
-        CHECK(cudaDeviceSynchronize());
+        //CHECK(cudaDeviceSynchronize());
+        
+        CHECK(cudaMemsetAsync(dangling_factor_gpu, 0.0, sizeof(double), dangling_factor_stream));  // asynchronously reset the dangling factor on the GPU
         
         // Check convergence
-        euclidean_distance_gpu<<<blocksPerGrid, threadsPerBlock>>>(pr_gpu, gpu_result, V, gpu_err);
+        euclidean_distance_gpu<<<blocksPerGrid, threadsPerBlock, blockSize * sizeof(double)>>>(pr_gpu, gpu_result, V, gpu_err);
         CHECK_KERNELCALL();
-        CHECK(cudaDeviceSynchronize());
+        //CHECK(cudaDeviceSynchronize());
+        //CHECK(cudaMemsetAsync(gpu_result, 0.0, sizeof(double) * V, spmv_stream));  
 
         cudaMemcpy(err, gpu_err, sizeof(double), cudaMemcpyDeviceToHost);
         *err = std::sqrt((float) *err);
@@ -351,12 +416,18 @@ void PersonalizedPageRank::personalized_pagerank_0(int iter){
         number_of_iterations++;
     }
 
+    CHECK(cudaDeviceSynchronize());
+
     if (debug) {
         // Synchronize computation by hand to measure GPU exec. time;
         auto end_tmp = clock_type::now();
         auto exec_time = chrono::duration_cast<chrono::microseconds>(end_tmp - start_tmp).count();
         std::cout << "  pure GPU execution(" << iter << ")=" << double(exec_time) / 1000 << " ms, " << (3 * sizeof(double) * N * N / (exec_time * 1e3)) << " GB/s" << std::endl;
     }
+
+    // destroy the streams
+    cudaStreamDestroy(spmv_stream);
+    cudaStreamDestroy(dangling_factor_stream);
 
     // save the GPU PPR values into the "pr" array
     CHECK(cudaMemcpy(&pr[0], pr_gpu, sizeof(double) * V, cudaMemcpyDeviceToHost));
