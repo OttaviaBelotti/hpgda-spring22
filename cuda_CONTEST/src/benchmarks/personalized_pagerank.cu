@@ -358,10 +358,7 @@ void PersonalizedPageRank::personalized_pagerank_0(int iter){
     dim3 blocksPerGridShared(gridSize_shared, 1, 1);
     dim3 threadsPerBlockShared(blockSize_shared, 1, 1);
 
-    double *temp;
-    double dangling_factor_val;
-    double *prev_pr = (double *) malloc(sizeof(double) * V); // previous values of pr
-    double *curr_pr = (double *) malloc(sizeof(double) * V); // current values of pr
+    double *temp, dangling_factor_val;
     double *err = (double *) malloc(sizeof(double));         // convergence error
 
     //printf("blocksPerGrid: %d\tthreadsPerBlock:%d\n", (E + blocksize - 1) / blocksize, blocksize);
@@ -431,10 +428,6 @@ void PersonalizedPageRank::personalized_pagerank_0(int iter){
 
     // save the GPU PPR values into the "pr" array
     CHECK(cudaMemcpy(&pr[0], pr_gpu, sizeof(double) * V, cudaMemcpyDeviceToHost));
-
-    free(prev_pr);
-    free(curr_pr);
-    free(err);
 }
 
 void PersonalizedPageRank::execute(int iter) {
