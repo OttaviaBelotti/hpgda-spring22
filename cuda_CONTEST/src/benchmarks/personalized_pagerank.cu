@@ -287,9 +287,19 @@ void PersonalizedPageRank::reset() {
  */
 __global__ void compute_dangling_factor_gpu(const int *a, const double *b, const int N, double *result){
     // using a share temp_result might speed up but we have problems in sync. the blocks
+    extern __shared__ double temp[];
+    temp[threadIdx.x]=0;
+    __syncthreads();
 
-    for(int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += blockDim.x * gridDim.x){
-        atomicAdd(result, a[i] * b[i]);
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < N) {
+        atomicAdd(temp + threadIdx.x, a[idx] * b[idx]);
+    }
+    __syncthreads();
+
+    collect_res_gpu(temp, blockDim.x);
+    if (threadIdx.x == 0) {
+        atomicAdd(result, temp[0]);
     }
 }
 
@@ -382,7 +392,7 @@ void PersonalizedPageRank::personalized_pagerank_0(int iter){
         //std::cout << "Requesting shared mem: " << V*sizeof(float)/1000 << "KB" << std::endl;
         //spmv_coo_1<<<blocksPerGrid, threadsPerBlock, V*sizeof(float)>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E, V);
 
-        compute_dangling_factor_gpu<<<blocksPerGrid, threadsPerBlock, 0, dangling_factor_stream>>>(dangling_bitmap, pr_gpu, V, dangling_factor_gpu);
+        compute_dangling_factor_gpu<<<blocksPerGrid, threadsPerBlock, blockSize * sizeof(double), dangling_factor_stream>>>(dangling_bitmap, pr_gpu, V, dangling_factor_gpu);
         CHECK_KERNELCALL();
         //CHECK(cudaDeviceSynchronize());
         //cudaStreamSynchronize(spmv_stream);
