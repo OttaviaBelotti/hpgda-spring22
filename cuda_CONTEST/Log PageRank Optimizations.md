@@ -37,3 +37,10 @@ We tested also the starting point suggested by the function `cudaMaxOccupancy()`
 
 * Had to downgread temp_res from double to float to be able to allocate the result vector in shared memory.
 * Still, even with float, Wikipedia result vector is too large to fit in shared memory
+
+## Segmentation reduction
+* Figure out MAX_BLOCKS --> for NVIDIA GeForce GTX 1050 (comput. 6.1) 5 active SM, from CUDA_OCCUPANCY_CALCULATOR we find that we have max 8 ative blocks per SM --> MAX_BLOCKS = 8 * 5 = 40
+
+
+## Computations in single-precision rather than double
+float helps reducing the space (e.g. on shared memory) but it doesn't speed up the computation that much. Casting takes time and, if instead we turn all the resources residing in the GPU memory to float, we still have to convert them into an array of double to place into the CPU result vector pr.

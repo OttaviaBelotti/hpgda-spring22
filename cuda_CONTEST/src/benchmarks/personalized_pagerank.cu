@@ -32,6 +32,7 @@
 #include <iostream>
 #include <vector>
 #include <algorithm>
+#include "spmv_seg.cu"
 
 namespace chrono = std::chrono;
 using clock_type = chrono::high_resolution_clock;
@@ -385,7 +386,8 @@ void PersonalizedPageRank::personalized_pagerank_0(int iter){
         //CHECK(cudaMemset(gpu_err, 0.0, sizeof(double)));           // reset error 
         //cudaMemset(dangling_factor_gpu, 0.0, sizeof(double));      // reset dangling factor
 
-        spmv_coo_0<<<blocksPerGrid, threadsPerBlock, 0 , spmv_stream>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E);
+        //spmv_coo_0<<<blocksPerGrid, threadsPerBlock, 0 , spmv_stream>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E);
+        __spmv_coo_flat(x_d, y_d, val_d, pr_gpu, gpu_result, E, spmv_stream);
         CHECK_KERNELCALL();
         //CHECK(cudaDeviceSynchronize());
         //cudaDeviceSetCacheConfig(cudaFuncCachePreferShared);
