@@ -31,6 +31,7 @@
 #include "personalized_pagerank.cuh"
 #include <iostream>
 #include <vector>
+#include <array>
 #include <algorithm>
 #include "spmv_seg.cu"
 
@@ -106,14 +107,6 @@ __global__ void spmv_coo_0(const int *x, const int *y, const double *val, const 
     }
 }
 
-__global__ void spmv_coo_temp(const int num_vals, int *row_ids, int *col_ids, double *values, int num_rows, double *x, double *y) {
-    
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_rows; i += blockDim.x * gridDim.x) {
-        if(i < num_vals){
-            atomicAdd(y+row_ids[i], values[i]*x[col_ids[i]]);
-        }
-    }
-}
 
 __global__ void spmv_coo_1(const int *x, const int *y, const double *val, const double *vec, double *result, const int N, const int res_size){
     extern __shared__ float temp_res[]; //must be initialized with N elements from the caller
@@ -135,6 +128,26 @@ __global__ void spmv_coo_1(const int *x, const int *y, const double *val, const 
         atomicAdd(&result[i], temp_res[i]);
     }
 
+}
+
+/**
+ * @brief Heuristi version. Compute spmv just for the first precision% (e.g. 80%) vertex
+ * 
+ * @return __global__ 
+ */
+__global__ void spmv_coo_h(const int *x, const int *y, const double *val, const double *vec, double *result, int N, const bool *excluded_pages){
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += blockDim.x * gridDim.x) {
+        if(!excluded_pages[x[i]])
+            atomicAdd(result + x[i], val[i] * vec[y[i]]);
+    }
+}
+
+
+__global__ void lower_pr_unselected_pages_h(double *result, bool *excluded_pages, int N){
+    for(int i= blockIdx.x * blockDim.x + threadIdx.x; i < N; i += blockDim.x * gridDim.x)
+        if(excluded_pages[i]){
+            result[i] = result[i]/10;
+        }
 }
 
 //////////////////////////////
@@ -227,6 +240,7 @@ void PersonalizedPageRank::alloc() {
     CHECK(cudaMalloc(&gpu_err, sizeof(double)));
     CHECK(cudaMalloc(&dangling_factor_gpu, sizeof(double)));
     CHECK(cudaMalloc(&dangling_bitmap, sizeof(int)*dangling.size()));
+    CHECK(cudaMalloc(&excluded_pages_gpu, sizeof(int) * V));
 
     CHECK(cudaMemcpy(x_d, &x[0], sizeof(int) * x.size(), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(y_d, &y[0], sizeof(int) * y.size(), cudaMemcpyHostToDevice));
@@ -238,6 +252,65 @@ void PersonalizedPageRank::alloc() {
 void PersonalizedPageRank::init() {
     // Do any additional CPU or GPU setup here;
     // TODO!
+
+    int last_idx = -1;
+    int last_idx_qty = 0;
+
+
+    std::vector<std::pair<int, int>> in_degree;
+    in_degree.resize(V);
+
+    //assumption: E > V
+    for(int i=0; i<E; i++){
+        //compute in_degree for each page: if page i not it x[i] --> in_degree[i] = 0
+        if(x[i] != last_idx){
+            if(last_idx >= 0){
+                in_degree[last_idx].first = last_idx_qty;
+                in_degree[last_idx].second = last_idx;
+            }
+
+            last_idx++;
+            last_idx_qty = (x[i] != last_idx) ? 0 : 1;
+
+        }else{
+            last_idx_qty++;
+        }
+    }
+    in_degree[last_idx].first = last_idx_qty; // finish writing the qty for the last page
+    in_degree[last_idx].second = last_idx;
+
+    while(last_idx < V){
+        // last pages are not in x, so finish up in_degree with zeros
+        last_idx++;
+        in_degree[last_idx].first = 0;
+        in_degree[last_idx].second = last_idx;
+    }
+
+    auto greater_key = [](std::pair<int,int> e1, std::pair<int,int> e2){
+        return e1.first > e2.first;
+        };
+
+    // sort in_degree_ranked
+    // key: in_degree   values: in_degree_ranked    comparer: reverting
+    sort(in_degree.begin(), in_degree.end(), greater_key);
+
+
+    bool excluded_pages[V];
+    int precise_vertex_qty = (int)(V * heuristic_precision);
+    std::cout << "Precision: " << heuristic_precision << ", #precise vertex: " << precise_vertex_qty << std::endl;
+
+    excluded_pages_cpu.resize(V);
+  
+    //std::cout << "Excluded pages:" << std::endl;
+    for(int i=0; i<V; i++){
+        excluded_pages_cpu[in_degree[i].second] = ( i< precise_vertex_qty) ? false : true;
+        excluded_pages[in_degree[i].second] = ( i< precise_vertex_qty) ? false : true;
+    }
+
+    
+
+
+    CHECK(cudaMemcpy(excluded_pages_gpu, &excluded_pages[0], sizeof(bool) * V, cudaMemcpyHostToDevice));
 }
 
 // Reset the state of the computation after every iteration.
@@ -258,23 +331,7 @@ void PersonalizedPageRank::reset() {
     CHECK(cudaMemcpy(dangling_bitmap, dangling.data(), sizeof(int)*dangling.size(), cudaMemcpyHostToDevice));
 
 
-    // INFO at each iteration
-    //compute the out_degree and the in_degree of the personalization_vertex
-    int in_degree = 0, out_degree = 0;
-    for(int i=0; i < E; i++){
-        if(x[i] == personalization_vertex)
-            in_degree++; //because in COO we have row/cols transposed
-        if(y[i] == personalization_vertex)
-            out_degree++;
-    }
-    printf("in_degree: %d\tout_degree: %d\n", in_degree, out_degree);
-
-    //if the personalization vector is lowly connected, then we lower the alpha
-    // if(in_degree < 0.001*V || out_degree < 0.001*V)
-    //     custom_alpha = 0.25;
-    // else
-    //     custom_alpha = DEFAULT_ALPHA;
-    printf("custom alpha: %lf\n", custom_alpha);
+    printf("Is personalization vertex %d in discarded pages? %s\n", personalization_vertex, excluded_pages_cpu[personalization_vertex] ? "true" : "false");
 }
 
 
@@ -373,13 +430,17 @@ void PersonalizedPageRank::personalized_pagerank_0(int iter){
     double *err = (double *) malloc(sizeof(double));         // convergence error
 
     //printf("blocksPerGrid: %d\tthreadsPerBlock:%d\n", (E + blocksize - 1) / blocksize, blocksize);
-    cudaStream_t spmv_stream, dangling_factor_stream;
+    cudaStream_t spmv_stream, dangling_factor_stream, lower_pr_stream;
     cudaStreamCreate(&spmv_stream);
     cudaStreamCreate(&dangling_factor_stream);
+    cudaStreamCreate(&lower_pr_stream);
+
+    
 
     int number_of_iterations = 0;
     bool conv = false;
     while (!conv && number_of_iterations < DEFAULT_MAX_ITER) {
+        //std::cout << "Inner iteration #" << number_of_iterations << std::endl;
         CHECK(cudaMemset(gpu_result, 0.0, sizeof(double) * V));    // reset GPU result
 
         //CHECK(cudaMemsetAsync(dangling_factor_gpu, 0.0, sizeof(double), dangling_factor_stream));  
@@ -387,32 +448,36 @@ void PersonalizedPageRank::personalized_pagerank_0(int iter){
         //cudaMemset(dangling_factor_gpu, 0.0, sizeof(double));      // reset dangling factor
 
         //spmv_coo_0<<<blocksPerGrid, threadsPerBlock, 0 , spmv_stream>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E);
-        __spmv_coo_flat(x_d, y_d, val_d, pr_gpu, gpu_result, E, spmv_stream);
-        CHECK_KERNELCALL();
+        //__spmv_coo_flat(x_d, y_d, val_d, pr_gpu, gpu_result, E, spmv_stream);
         //CHECK(cudaDeviceSynchronize());
         //cudaDeviceSetCacheConfig(cudaFuncCachePreferShared);
-        //std::cout << "Requesting shared mem: " << V*sizeof(float)/1000 << "KB" << std::endl;
         //spmv_coo_1<<<blocksPerGrid, threadsPerBlock, V*sizeof(float)>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E, V);
+        spmv_coo_h<<<blocksPerGrid, threadsPerBlock, 0, spmv_stream>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E, excluded_pages_gpu);
+        CHECK_KERNELCALL();
+
+        lower_pr_unselected_pages_h<<<blocksPerGrid, threadsPerBlock, 0, lower_pr_stream>>>(gpu_result, excluded_pages_gpu, V);
+        CHECK_KERNELCALL();
 
         compute_dangling_factor_gpu<<<blocksPerGrid, threadsPerBlock, blockSize * sizeof(double), dangling_factor_stream>>>(dangling_bitmap, pr_gpu, V, dangling_factor_gpu);
+        //compute_dangling_factor_h<<<blocksPerGrid, threadsPerBlock, blockSize * sizeof(double), dangling_factor_stream>>>(dangling_bitmap, pr_gpu, V, dangling_factor_gpu, excluded_pages_gpu);
         CHECK_KERNELCALL();
-        //CHECK(cudaDeviceSynchronize());
-        //cudaStreamSynchronize(spmv_stream);
-        //cudaStreamSynchronize(dangling_factor_stream);
+
+        //on wiki si rompe la dangling ( o forse ancora prima?)
 
         CHECK(cudaMemcpy(&dangling_factor_val, dangling_factor_gpu, sizeof(double), cudaMemcpyDeviceToHost));
 
         axpb_personalized_gpu<<<blocksPerGrid, threadsPerBlock>>>(custom_alpha, gpu_result, custom_alpha * dangling_factor_val / V, personalization_vertex, gpu_result, V);
+        //axpb_personalized_h<<<blocksPerGrid, threadsPerBlock>>>(custom_alpha, gpu_result, custom_alpha * dangling_factor_val / V, personalization_vertex, gpu_result, V, excluded_pages_gpu);
         CHECK_KERNELCALL();
-        //CHECK(cudaDeviceSynchronize());
+
         
         CHECK(cudaMemsetAsync(dangling_factor_gpu, 0.0, sizeof(double), dangling_factor_stream));  // asynchronously reset the dangling factor on the GPU
         
         // Check convergence
         euclidean_distance_gpu<<<blocksPerGrid, threadsPerBlock, blockSize * sizeof(double)>>>(pr_gpu, gpu_result, V, gpu_err);
+        //euclidean_distance_h<<<blocksPerGrid, threadsPerBlock, blockSize * sizeof(double)>>>(pr_gpu, gpu_result, V, gpu_err, excluded_pages_gpu);
         CHECK_KERNELCALL();
-        //CHECK(cudaDeviceSynchronize());
-        //CHECK(cudaMemsetAsync(gpu_result, 0.0, sizeof(double) * V, spmv_stream));  
+
 
         cudaMemcpy(err, gpu_err, sizeof(double), cudaMemcpyDeviceToHost);
         *err = std::sqrt((float) *err);
@@ -437,6 +502,7 @@ void PersonalizedPageRank::personalized_pagerank_0(int iter){
     // destroy the streams
     cudaStreamDestroy(spmv_stream);
     cudaStreamDestroy(dangling_factor_stream);
+    cudaStreamDestroy(lower_pr_stream);
 
     // save the GPU PPR values into the "pr" array
     CHECK(cudaMemcpy(&pr[0], pr_gpu, sizeof(double) * V, cudaMemcpyDeviceToHost));
@@ -527,4 +593,5 @@ void PersonalizedPageRank::clean() {
     cudaFree(gpu_err);
     cudaFree(dangling_factor_gpu);
     cudaFree(dangling_bitmap);
+    cudaFree(excluded_pages_gpu);
 }

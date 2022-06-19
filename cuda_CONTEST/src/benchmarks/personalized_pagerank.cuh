@@ -138,6 +138,10 @@ class PersonalizedPageRank : public Benchmark {
     std::vector<int> y;       // Destination coordinate of edges in graph;
     std::vector<double> val;  // Used for matrix value, initially all values are 1;
 
+    // heurist computation
+    bool *excluded_pages_gpu;
+    std::vector<bool> excluded_pages_cpu; //not needed in final implementation, just for print
+
     // COO format GPU
     int *x_d;               // Source coordinate of edges in graph -- GPU
     int *y_d;               // Destination coordinate of edges in graph -- GPU
@@ -172,4 +176,6 @@ class PersonalizedPageRank : public Benchmark {
 
     void initialize_graph();
     void personalized_pagerank_0(int iter);
+
+    float heuristic_precision = 0.80; // 80%
 };
