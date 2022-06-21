@@ -461,7 +461,8 @@ __global__ void compute_dangling_factor_gpu(const int *a, const double *b, const
 
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < N) {
-        atomicAdd(temp + threadIdx.x, a[idx] * b[idx]);
+        temp[threadIdx.x] = a[idx] * b[idx];
+        //atomicAdd(temp + threadIdx.x, a[idx] * b[idx]);
     }
     __syncthreads();
 
@@ -504,22 +505,25 @@ __global__ void axpb_personalized_gpu(double alpha, double *x, double beta, cons
  */
 __global__ void euclidean_distance_gpu(const double* x , const double* y , const int N, double* result, bool *excluded_pages) {
     extern __shared__ double temp[];
-    double var;
+    temp[threadIdx.x]=0;
+    __syncthreads();
+    
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    double var;
 
-    //if(!excluded_pages[idx]){
-        if (idx < N) {
-            var = (excluded_pages[idx]) ? 0 : x[idx] - y[idx]; //divergence?
-            //var = x[idx] - y[idx];
-            temp[threadIdx.x] = var*var;
-        }
-        __syncthreads();
-        
-        collect_res_gpu(temp, blockDim.x);
-        if (threadIdx.x == 0) {
-            atomicAdd(result, temp[0]);
-        }
-    //}
+    if (idx < N) {
+        var = x[idx] - y[idx];
+        //TODO: which one is faster? do i need atomic op. with reduction?
+        //atomicAdd(temp + threadIdx.x, var * var);
+        //temp[threadIdx.x] = __pow(var, 2);
+        temp[threadIdx.x] = var * var;
+    }
+    __syncthreads();
+    
+    collect_res_gpu(temp, blockDim.x);
+    if (threadIdx.x == 0) {
+        atomicAdd(result, temp[0]);
+    }
 }
 
 void PersonalizedPageRank::personalized_pagerank_0(int iter){
@@ -558,7 +562,7 @@ void PersonalizedPageRank::personalized_pagerank_0(int iter){
         CHECK(cudaMemset(gpu_result, 0.0, sizeof(double) * V));    // reset GPU result
 
         //CHECK(cudaMemsetAsync(dangling_factor_gpu, 0.0, sizeof(double), dangling_factor_stream));  
-        //CHECK(cudaMemset(gpu_err, 0.0, sizeof(double)));           // reset error 
+        CHECK(cudaMemset(gpu_err, 0.0, sizeof(double)));             // reset error 
         //cudaMemset(dangling_factor_gpu, 0.0, sizeof(double));      // reset dangling factor
 
         spmv_coo_0<<<blocksPerGrid, threadsPerBlock, 0 , spmv_stream>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E);
@@ -600,6 +604,8 @@ void PersonalizedPageRank::personalized_pagerank_0(int iter){
         temp = pr_gpu;
         pr_gpu = gpu_result;
         gpu_result = temp; 
+
+        //printf("ITER: %d - ERR: %lf\n", number_of_iterations, *err);
 
         number_of_iterations++;
     }
