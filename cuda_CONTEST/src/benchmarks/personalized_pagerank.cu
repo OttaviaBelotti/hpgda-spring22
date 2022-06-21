@@ -346,8 +346,6 @@ void PersonalizedPageRank::init() {
     sort(in_degree.begin(), in_degree.end(), greater_key);
 
 
-    std::vector<bool> excluded_pages;
-    excluded_pages.resize(V);
     int precise_vertex_qty = (int)(V * heuristic_precision);
     std::cout << "Precision: " << heuristic_precision << ", #precise vertex: " << precise_vertex_qty << std::endl;
 
@@ -357,42 +355,10 @@ void PersonalizedPageRank::init() {
     //std::cout << "Excluded pages:" << std::endl;
     for(int i=0; i<V; i++){
         excluded_pages_cpu[in_degree[i].second] = (i< precise_vertex_qty && in_degree[i].first != 0) ? false : true;
-        //excluded_pages_cpu.insert(excluded_pages_cpu.begin() + in_degree[i].second, (i< precise_vertex_qty && in_degree[i].first != 0) ? false : true);
-        excluded_pages[in_degree[i].second] = (i< precise_vertex_qty && in_degree[i].first != 0) ? false : true;
     }
 
-    int num_effective_vertex = std::count(excluded_pages_cpu, &excluded_pages_cpu[V-1], false);
+    num_effective_vertex = std::count(excluded_pages_cpu, &excluded_pages_cpu[V-1], false);
 
-    for(int i=0; i<V; i++){
-        if(excluded_pages_cpu[i]){
-            pr[i] = 0;
-        }else{
-            pr[i] = 1/num_effective_vertex;
-        }
-    }
-
-    /*
-    int new_matrix_size = remove_excluded_pages_from_matrix(excluded_pages, x, y, val, E);
-
-    // resizing of x,y,val for GPU (temporarely done here)
-    CHECK(cudaFree(x_d));
-    CHECK(cudaFree(y_d));
-    CHECK(cudaFree(val_d));
-
-    CHECK(cudaMalloc(&x_d, sizeof(int)*new_matrix_size));
-    CHECK(cudaMalloc(&y_d, sizeof(int)*new_matrix_size));
-    CHECK(cudaMalloc(&val_d, sizeof(double)*new_matrix_size));
-
-    printf("x,y,val size: %lu, %lu, %lu\tnew_dim: %d\n", x.size(), y.size(), val.size(), new_matrix_size);
-    CHECK(cudaMemcpy(x_d, &x[0], sizeof(int) * x.size(), cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(y_d, &y[0], sizeof(int) * y.size(), cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(val_d, &val[0], sizeof(double) * val.size(), cudaMemcpyHostToDevice));
-
-    E = new_matrix_size;
-    
-    */
-
-    CHECK(cudaMemcpy(pr_gpu, &pr[0], sizeof(double) * V, cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(excluded_pages_gpu, excluded_pages_cpu, sizeof(bool) * V, cudaMemcpyHostToDevice));
 }
 
@@ -427,8 +393,23 @@ inline int remove_excluded_pages_from_matrix(bool *excluded, std::vector<int> &x
 // Reset the result, and transfer data to the GPU if necessary;
 void PersonalizedPageRank::reset() {
     // Reset the PageRank vector (uniform initialization, 1 / V for each vertex);
-    std::fill(pr.begin(), pr.end(), 1.0 / V); 
+    //std::fill(pr.begin(), pr.end(), 1.0 / V); 
     // Generate a new personalization vertex for this iteration;
+    
+    
+    double penalty_weight = 0.1;
+    float weighted_sum = num_effective_vertex * (1 - penalty_weight) + (V - num_effective_vertex) * penalty_weight;
+
+    for(int i=0; i<V; i++){
+        if(excluded_pages_cpu[i]){
+            pr[i] = penalty_weight * (1/weighted_sum);
+        }else{
+            pr[i] = (1-penalty_weight) * (1/weighted_sum);
+        }
+    }
+    
+    
+
     personalization_vertex = rand() % V; 
     if (debug) std::cout << "personalization vertex=" << personalization_vertex << std::endl;
 
@@ -565,8 +546,8 @@ void PersonalizedPageRank::personalized_pagerank_0(int iter){
         CHECK(cudaMemset(gpu_err, 0.0, sizeof(double)));             // reset error 
         //cudaMemset(dangling_factor_gpu, 0.0, sizeof(double));      // reset dangling factor
 
-        spmv_coo_0<<<blocksPerGrid, threadsPerBlock, 0 , spmv_stream>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E);
-        //__spmv_coo_flat(x_d, y_d, val_d, pr_gpu, gpu_result, E, spmv_stream);
+        //spmv_coo_0<<<blocksPerGrid, threadsPerBlock, 0 , spmv_stream>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E);
+        __spmv_coo_flat(x_d, y_d, val_d, pr_gpu, gpu_result, E, spmv_stream);
         //CHECK(cudaDeviceSynchronize());
         //cudaDeviceSetCacheConfig(cudaFuncCachePreferShared);
         //spmv_coo_1<<<blocksPerGrid, threadsPerBlock, V*sizeof(float)>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E, V);

@@ -141,6 +141,7 @@ class PersonalizedPageRank : public Benchmark {
     // heurist computation
     bool *excluded_pages_gpu;
     bool* excluded_pages_cpu; //not needed in final implementation, just for print
+    int num_effective_vertex; //all pages with in_degree != 0
 
     // COO format GPU
     int *x_d;               // Source coordinate of edges in graph -- GPU
