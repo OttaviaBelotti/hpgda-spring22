@@ -140,7 +140,7 @@ class PersonalizedPageRank : public Benchmark {
 
     // heurist computation
     bool *excluded_pages_gpu;
-    std::vector<bool> excluded_pages_cpu; //not needed in final implementation, just for print
+    bool* excluded_pages_cpu; //not needed in final implementation, just for print
 
     // COO format GPU
     int *x_d;               // Source coordinate of edges in graph -- GPU
