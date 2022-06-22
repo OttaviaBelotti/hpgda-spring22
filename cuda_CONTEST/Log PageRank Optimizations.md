@@ -42,5 +42,14 @@ We tested also the starting point suggested by the function `cudaMaxOccupancy()`
 * Figure out MAX_BLOCKS --> for NVIDIA GeForce GTX 1050 (comput. 6.1) 5 active SM, from CUDA_OCCUPANCY_CALCULATOR we find that we have max 8 ative blocks per SM --> MAX_BLOCKS = 8 * 5 = 40
 
 
-## Computations in single-precision rather than double
-float helps reducing the space (e.g. on shared memory) but it doesn't speed up the computation that much. Casting takes time and, if instead we turn all the resources residing in the GPU memory to float, we still have to convert them into an array of double to place into the CPU result vector pr.
+## Reduce precision
+* wikipedia 30 run, 256 threads per block, uniform initialization of PR vector
+    - float precision on spmv, half precision on dangling: 100% accuracy, 2055.22 ms avg
+    - half precision on spmv: no, accuracy too low
+    - float precision on spmv, half on dangling, half on axpb: 100% accuracy, 2038.63 ms
+    - all the above  + float precision on euclidean_distance (should also reduce the number of iterations): 100% accuracy, 1915.1 ms
+* wikipedia 100 run, 256 threads per block, uniform initialization
+    - float precision on spmv, half precision on dangling, float on axpb, float on euclidean_distance: 100% accuracy but one run at 95%, one 85%, one 65%, 1917.38 ms
+
+* wikipedia 100 run, 256 threads per block, non-uniform pr penalty weight 0.1:
+    - float precision on spmv, half precision on dangling, float on axpb, float on euclidean_distance: 1 95%, 1 65% (it.57), 1 85%,  1869 ms

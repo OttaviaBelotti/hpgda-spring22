@@ -28,7 +28,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #pragma once
-#include <unordered_set>
+#include <set>
 #include <iterator>
 #include "../benchmark.cuh"
 
@@ -151,7 +151,7 @@ class PersonalizedPageRank : public Benchmark {
     double *gpu_result;     // result of kernel function -- GPU
 
     // dangling GPU
-    double *dangling_factor_gpu;
+    float *dangling_factor_gpu;
     int *dangling_bitmap;
 
     //damping
