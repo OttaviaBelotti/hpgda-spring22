@@ -177,6 +177,7 @@ class PersonalizedPageRank : public Benchmark {
 
     void initialize_graph();
     void personalized_pagerank_0(int iter);
+    void personalized_pagerank_1(int iter);
 
     float heuristic_precision = 0.80; // 80%
 };
