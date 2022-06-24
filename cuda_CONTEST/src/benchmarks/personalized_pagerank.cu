@@ -41,10 +41,15 @@ using clock_type = chrono::high_resolution_clock;
 
 //////////////////////////////
 //////////////////////////////
-inline int remove_excluded_pages_from_matrix(bool *excluded, std::vector<int> &x, std::vector<int> &y, std::vector<double> &val, int E);
 
 // Write GPU kernel here!
 
+/**
+ * @brief GPU function that perform the warp reduction.
+ * 
+ * @param input input array to reduce
+ * @param threadId index of the thread
+ */
 __inline__ __device__ void warp_reduction(volatile float *input, int threadId)
 // we need volatile flag here, otherwise the compiler might introduce some optimizations in the "input" variable
 // and place it in registers instead of shared memory!
@@ -57,11 +62,16 @@ __inline__ __device__ void warp_reduction(volatile float *input, int threadId)
 	input[threadId] += input[threadId + 1];
 }
 
-__device__ void collect_res_gpu(float *input, int numOfBlocks) // compute the final reduction
+/**
+ * @brief GPU function that compute the final parallel reduction for the collected data.
+ * 
+ * @param input input array to reduce
+ */
+__device__ void collect_res_gpu(float *input)
 {
     int i, threadId = threadIdx.x;
 
-    for (i = blockDim.x / 2; i > 32; i >>= 1) // compute the parallel reduction for the collected data
+    for (i = blockDim.x / 2; i > 32; i >>= 1) 
     {
         if (threadId < i)
         {
@@ -75,8 +85,24 @@ __device__ void collect_res_gpu(float *input, int numOfBlocks) // compute the fi
     __syncthreads();
 }
 
+__device__ int binary_search_element(const int elem, const int *arr, int low, int high){
+    int mid;
+    while( low != high ){
+        mid = (low + high)/2;
+        if (elem == arr[mid])
+        return mid;
+
+        else if (elem > arr[mid])   // elem is on the right side
+            low = mid + 1;
+
+        else                        // elem is on the left side
+            high = mid - 1;
+    }
+    return -1; //not found
+}
+
 /**
- * @brief Parallel GPU version of matrix-vector multiplication.
+ * @brief Parallel GPU version of matrix-vector multiplication, uses a grid-stride loop to perform the dot product.
  * 
  * @param x row indices (COO format matrix - vector)
  * @param y column indices (COO format matrix - vector)
@@ -86,14 +112,8 @@ __device__ void collect_res_gpu(float *input, int numOfBlocks) // compute the fi
  * @param N vector dimension
  */
 __global__ void spmv_coo(const int *x, const int *y, const double *val, const double *vec, double *result, int N) {
-    // Uses a grid-stride loop to perform dot product
-    //half val_h, vec_h;
-
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += blockDim.x * gridDim.x) {
-        //val_h = __float2half((float)val[i]);
-        //vec_h = __float2half((float)vec[y[i]]);
         atomicAdd(result + x[i], (float)val[i] * (float)vec[y[i]]);
-        //atomicAdd(result + x[i], val_h * vec_h);
     }
 }
 
@@ -128,15 +148,11 @@ __global__ void compute_dangling_factor_gpu_reduction(const int *a, const double
 
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < N) {
-        //a_h = __float2half((float)a[idx]);
-        //b_h = __float2half((float)b[idx]);
         temp[threadIdx.x] = (float)a[idx] * (float)b[idx];
-        //temp[threadIdx.x] = a_h * b_h;
-        //atomicAdd(temp + threadIdx.x, a[idx] * b[idx]);
     }
     __syncthreads();
 
-    collect_res_gpu(temp, blockDim.x);
+    collect_res_gpu(temp);
     if (threadIdx.x == 0) {
         atomicAdd(result, temp[0]);
     }
@@ -157,10 +173,7 @@ __global__ void axpb_personalized_gpu(double alpha, double *x, double beta, cons
     float beta_h = (float) beta;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
 
-    //if(threadIdx.x == 0)
     one_minus_alpha = 1 - alpha_h;
-    
-    //__syncthreads();
 
     for(; i < N; i+= blockDim.x * gridDim.x){
         result[i] = alpha_h * x[i] + beta_h + ((personalization_vertex == i) ? one_minus_alpha : (float)0.0);
@@ -176,8 +189,6 @@ __global__ void axpb_personalized_gpu(double alpha, double *x, double beta, cons
  * @param result pointer to the computed distance result
  */
 __global__ void euclidean_distance_gpu(const double *x, const double *y, const int N, double *result) {
-    //can be improved
-
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += blockDim.x * gridDim.x) {
         atomicAdd(result, (x[i] - y[i]) * (x[i] - y[i]));
     }
@@ -201,33 +212,14 @@ __global__ void euclidean_distance_gpu_reduction(const double* x , const double*
 
     if (idx < N) {
         var = (float)x[idx] - (float)y[idx];
-        //TODO: which one is faster? do i need atomic op. with reduction?
-        //atomicAdd(temp + threadIdx.x, var * var);
-        //temp[threadIdx.x] = __pow(var, 2);
         temp[threadIdx.x] = var * var;
     }
     __syncthreads();
     
-    collect_res_gpu(temp, blockDim.x);
+    collect_res_gpu(temp);
     if (threadIdx.x == 0) {
         atomicAdd(result, temp[0]);
     }
-}
-
-__device__ int binary_search_element(const int elem, const int *arr, int low, int high){
-    int mid;
-    while( low != high ){
-        mid = (low + high)/2;
-        if (elem == arr[mid])
-        return mid;
-
-        else if (elem > arr[mid]) // elem is on the right side
-            low = mid + 1;
-
-        else                  // elem is on the left side
-            high = mid - 1;
-    }
-    return -1; //not found
 }
 
 __global__ void spmv_coo_1(const int *x, const int *y, const double *val, const double *vec, double *result, const int N, const int res_size, int *shrinked_x){
@@ -257,33 +249,6 @@ __global__ void spmv_coo_1(const int *x, const int *y, const double *val, const 
     for(int i=threadIdx.x; i < res_size; i += blockDim.x){
         atomicAdd(&result[temp_idx[i]], temp_res[i]);
     }
-
-}
-
-//highly dependent on how the kernel accesses vector x
-void compute_shrinked_x(std::vector<int> &shrinked_x, const int threadsPerBlock, const int blocksPerGrid, std::vector<int> x, const int E){
-    int threadIdx = 0;
-    int blockIdx = 0;
-    int last_idx = -1;
-    int last_block = 0;
-
-    if(threadsPerBlock < 1 || blocksPerGrid < 1){
-        return;
-    }
-
-    for(int i=0; i < E; i++){
-        if(!(last_idx == x[i] && blockIdx == last_block)){
-            shrinked_x.push_back(x[i]);
-        }
-
-        threadIdx = (threadIdx + 1) % threadsPerBlock;
-        if(threadIdx == 0){
-            last_block = blockIdx;
-            blockIdx = (blockIdx + 1) % blocksPerGrid;
-        }
-    }
-
-    //warning: if a single page is present in x enough times so that it is repeated even in the second call of a same block, then we will have duplicates in temp_idx in spmv_coo_1
 
 }
 
@@ -377,7 +342,6 @@ void PersonalizedPageRank::alloc() {
     CHECK(cudaMalloc(&gpu_err, sizeof(double)));
     CHECK(cudaMalloc(&dangling_factor_gpu, sizeof(float)));
     CHECK(cudaMalloc(&dangling_bitmap, sizeof(int)*dangling.size()));
-    //CHECK(cudaMalloc(&excluded_pages_gpu, sizeof(bool) * V));
 
     CHECK(cudaMemcpy(x_d, &x[0], sizeof(int) * x.size(), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(y_d, &y[0], sizeof(int) * y.size(), cudaMemcpyHostToDevice));
@@ -392,7 +356,6 @@ void PersonalizedPageRank::init() {
     
     int last_idx = -1;
     int last_idx_qty = 0;
-
 
     std::vector<std::pair<int, int>> in_degree;
     in_degree.resize(V);
@@ -444,9 +407,6 @@ void PersonalizedPageRank::init() {
     }
 
     num_effective_vertex = std::count(excluded_pages_cpu, &excluded_pages_cpu[V-1], false);
-
-    //CHECK(cudaMemcpy(excluded_pages_gpu, excluded_pages_cpu, sizeof(bool) * V, cudaMemcpyHostToDevice));
-    
 }
 
 // Reset the state of the computation after every iteration.
@@ -478,14 +438,15 @@ void PersonalizedPageRank::reset() {
     // TODO!
 
     CHECK(cudaMemcpy(pr_gpu, &pr[0], sizeof(double) * pr.size(), cudaMemcpyHostToDevice));
-    // initialize GPU result array with all 0s
-    CHECK(cudaMemset(gpu_result, 0.0, sizeof(double)*V));
+    CHECK(cudaMemset(gpu_result, 0.0, sizeof(double)*V));   // initialize GPU result array with all 0s
     CHECK(cudaMemcpy(dangling_bitmap, dangling.data(), sizeof(int)*dangling.size(), cudaMemcpyHostToDevice));
-
-
-    //printf("Is personalization vertex %d in discarded pages? %s\n", personalization_vertex, excluded_pages_cpu[personalization_vertex] ? "true" : "false");
 }
 
+/**
+ * @brief First implementation, plain CPU-to-GPU CUDA transposition.
+ * 
+ * @param iter iteration number
+*/
 void PersonalizedPageRank::personalized_pagerank_0(int iter){
     auto start_tmp = clock_type::now();
  
@@ -497,44 +458,29 @@ void PersonalizedPageRank::personalized_pagerank_0(int iter){
 
     double *temp;
     float dangling_factor_val;
-    double *err = (double *) malloc(sizeof(double));         // convergence error
+    double *err = (double *) malloc(sizeof(double)); 
 
     int number_of_iterations = 0;
     bool conv = false;
     while (!conv && number_of_iterations < max_iterations) {
-        //std::cout << "Inner iteration #" << number_of_iterations << std::endl;
         CHECK(cudaMemset(gpu_result, 0.0, sizeof(double) * V));    // reset GPU result
-
-        //CHECK(cudaMemsetAsync(dangling_factor_gpu, 0.0, sizeof(double), dangling_factor_stream));  
-        CHECK(cudaMemset(gpu_err, 0.0, sizeof(double)));             // reset error 
-        cudaMemset(dangling_factor_gpu, 0.0, sizeof(float));      // reset dangling factor
+        CHECK(cudaMemset(gpu_err, 0.0, sizeof(double)));           // reset error 
+        cudaMemset(dangling_factor_gpu, 0.0, sizeof(float));       // reset dangling factor
 
         spmv_coo<<<blocksPerGrid, threadsPerBlock>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E);
-        //__spmv_coo_flat(x_d, y_d, val_d, pr_gpu, gpu_result, E, spmv_stream);
-        //spmv_coo_1<<<blocksPerGrid, threadsPerBlock, V*sizeof(float)>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E, V);
-        //spmv_coo_h<<<blocksPerGrid, threadsPerBlock, 0, spmv_stream>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E, excluded_pages_gpu);
         CHECK_KERNELCALL();
-
-        //lower_pr_unselected_pages_h<<<blocksPerGrid, threadsPerBlock, 0, lower_pr_stream>>>(gpu_result, excluded_pages_gpu, V);
-        //CHECK_KERNELCALL();
 
         compute_dangling_factor_gpu<<<blocksPerGrid, threadsPerBlock>>>(dangling_bitmap, pr_gpu, V, dangling_factor_gpu);
-        //compute_dangling_factor_h<<<blocksPerGrid, threadsPerBlock, blockSize * sizeof(double), dangling_factor_stream>>>(dangling_bitmap, pr_gpu, V, dangling_factor_gpu, excluded_pages_gpu);
         CHECK_KERNELCALL();
-
-        //on wiki si rompe la dangling ( o forse ancora prima?)
 
         CHECK(cudaMemcpy(&dangling_factor_val, dangling_factor_gpu, sizeof(float), cudaMemcpyDeviceToHost));
 
         axpb_personalized_gpu<<<blocksPerGrid, threadsPerBlock>>>(custom_alpha, gpu_result, custom_alpha * dangling_factor_val / V, personalization_vertex, gpu_result, V);
-        //axpb_personalized_h<<<blocksPerGrid, threadsPerBlock>>>(custom_alpha, gpu_result, custom_alpha * dangling_factor_val / V, personalization_vertex, gpu_result, V, excluded_pages_gpu);
         CHECK_KERNELCALL();
         
         // Check convergence
         euclidean_distance_gpu<<<blocksPerGrid, threadsPerBlock>>>(pr_gpu, gpu_result, V, gpu_err);
-        //euclidean_distance_h<<<blocksPerGrid, threadsPerBlock, blockSize * sizeof(double)>>>(pr_gpu, gpu_result, V, gpu_err, excluded_pages_gpu);
         CHECK_KERNELCALL();
-
 
         cudaMemcpy(err, gpu_err, sizeof(double), cudaMemcpyDeviceToHost);
         *err = std::sqrt((double) *err);
@@ -544,11 +490,8 @@ void PersonalizedPageRank::personalized_pagerank_0(int iter){
         pr_gpu = gpu_result;
         gpu_result = temp; 
 
-        //printf("ITER: %d - ERR: %lf\n", number_of_iterations, *err);
-
         number_of_iterations++;
     }
-    //std::cout << "Total inner iteration #" << number_of_iterations << std::endl;
 
     CHECK(cudaDeviceSynchronize());
 
@@ -563,6 +506,11 @@ void PersonalizedPageRank::personalized_pagerank_0(int iter){
     CHECK(cudaMemcpy(&pr[0], pr_gpu, sizeof(double) * V, cudaMemcpyDeviceToHost));
 }
 
+/**
+ * @brief Second implementation, final optimized version.
+ * 
+ * @param iter iteration number
+*/
 void PersonalizedPageRank::personalized_pagerank_1(int iter){
     auto start_tmp = clock_type::now();
  
@@ -574,9 +522,8 @@ void PersonalizedPageRank::personalized_pagerank_1(int iter){
 
     double *temp;
     float dangling_factor_val;
-    double *err = (double *) malloc(sizeof(double));         // convergence error
+    double *err = (double *) malloc(sizeof(double));   // convergence error
 
-    //printf("blocksPerGrid: %d\tthreadsPerBlock:%d\n", (E + blocksize - 1) / blocksize, blocksize);
     cudaStream_t spmv_stream, dangling_factor_stream;
     cudaStreamCreate(&spmv_stream);
     cudaStreamCreate(&dangling_factor_stream);
@@ -584,42 +531,25 @@ void PersonalizedPageRank::personalized_pagerank_1(int iter){
     int number_of_iterations = 0;
     bool conv = false;
     while (!conv && number_of_iterations < max_iterations) {
-        //std::cout << "Inner iteration #" << number_of_iterations << std::endl;
-        CHECK(cudaMemset(gpu_result, 0.0, sizeof(double) * V));    // reset GPU result
-
-        //CHECK(cudaMemsetAsync(dangling_factor_gpu, 0.0, sizeof(double), dangling_factor_stream));  
+        CHECK(cudaMemset(gpu_result, 0.0, sizeof(double) * V));      // reset GPU result
         CHECK(cudaMemset(gpu_err, 0.0, sizeof(double)));             // reset error 
-        //cudaMemset(dangling_factor_gpu, 0.0, sizeof(double));      // reset dangling factor
 
         spmv_coo<<<blocksPerGrid, threadsPerBlock, 0 , spmv_stream>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E);
-        //__spmv_coo_flat(x_d, y_d, val_d, pr_gpu, gpu_result, E, spmv_stream);
-        //spmv_coo_1<<<blocksPerGrid, threadsPerBlock, V*sizeof(float)>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E, V);
-        //spmv_coo_h<<<blocksPerGrid, threadsPerBlock, 0, spmv_stream>>>(x_d, y_d, val_d, pr_gpu, gpu_result, E, excluded_pages_gpu);
         CHECK_KERNELCALL();
-
-        //lower_pr_unselected_pages_h<<<blocksPerGrid, threadsPerBlock, 0, lower_pr_stream>>>(gpu_result, excluded_pages_gpu, V);
-        //CHECK_KERNELCALL();
 
         compute_dangling_factor_gpu_reduction<<<blocksPerGrid, threadsPerBlock, blockSize * sizeof(float), dangling_factor_stream>>>(dangling_bitmap, pr_gpu, V, dangling_factor_gpu);
-        //compute_dangling_factor_h<<<blocksPerGrid, threadsPerBlock, blockSize * sizeof(double), dangling_factor_stream>>>(dangling_bitmap, pr_gpu, V, dangling_factor_gpu, excluded_pages_gpu);
         CHECK_KERNELCALL();
-
-        //on wiki si rompe la dangling ( o forse ancora prima?)
 
         CHECK(cudaMemcpy(&dangling_factor_val, dangling_factor_gpu, sizeof(float), cudaMemcpyDeviceToHost));
 
         axpb_personalized_gpu<<<blocksPerGrid, threadsPerBlock>>>(custom_alpha, gpu_result, custom_alpha * dangling_factor_val / V, personalization_vertex, gpu_result, V);
-        //axpb_personalized_h<<<blocksPerGrid, threadsPerBlock>>>(custom_alpha, gpu_result, custom_alpha * dangling_factor_val / V, personalization_vertex, gpu_result, V, excluded_pages_gpu);
         CHECK_KERNELCALL();
 
-        
         CHECK(cudaMemsetAsync(dangling_factor_gpu, 0.0, sizeof(float), dangling_factor_stream));  // asynchronously reset the dangling factor on the GPU
         
         // Check convergence
         euclidean_distance_gpu_reduction<<<blocksPerGrid, threadsPerBlock, blockSize * sizeof(float)>>>(pr_gpu, gpu_result, V, gpu_err/*, excluded_pages_gpu*/);
-        //euclidean_distance_h<<<blocksPerGrid, threadsPerBlock, blockSize * sizeof(double)>>>(pr_gpu, gpu_result, V, gpu_err, excluded_pages_gpu);
         CHECK_KERNELCALL();
-
 
         cudaMemcpy(err, gpu_err, sizeof(double), cudaMemcpyDeviceToHost);
         *err = std::sqrt((double) *err);
@@ -629,11 +559,8 @@ void PersonalizedPageRank::personalized_pagerank_1(int iter){
         pr_gpu = gpu_result;
         gpu_result = temp; 
 
-        //printf("ITER: %d - ERR: %lf\n", number_of_iterations, *err);
-
         number_of_iterations++;
     }
-    //std::cout << "Total inner iteration #" << number_of_iterations << std::endl;
 
     CHECK(cudaDeviceSynchronize());
 
@@ -647,7 +574,6 @@ void PersonalizedPageRank::personalized_pagerank_1(int iter){
     // destroy the streams
     cudaStreamDestroy(spmv_stream);
     cudaStreamDestroy(dangling_factor_stream);
-    //cudaStreamDestroy(lower_pr_stream);
 
     // save the GPU PPR values into the "pr" array
     CHECK(cudaMemcpy(&pr[0], pr_gpu, sizeof(double) * V, cudaMemcpyDeviceToHost));
@@ -658,10 +584,10 @@ void PersonalizedPageRank::execute(int iter) {
     switch (implementation)
     {
     case 0:
-        personalized_pagerank_0(iter); // first basic implementation
+        personalized_pagerank_0(iter); // first implementation
         break;
     case 1:
-        personalized_pagerank_1(iter); // second implementation with cuda streams, parallel reduction, segmented reduction, single-precision 
+        personalized_pagerank_1(iter); // second implementation
         break;
     default:
         break;
@@ -741,7 +667,6 @@ void PersonalizedPageRank::clean() {
     cudaFree(gpu_err);
     cudaFree(dangling_factor_gpu);
     cudaFree(dangling_bitmap);
-    cudaFree(excluded_pages_gpu);
 
 
     free(excluded_pages_cpu);
