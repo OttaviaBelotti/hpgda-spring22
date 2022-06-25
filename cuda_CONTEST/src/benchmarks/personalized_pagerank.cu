@@ -33,7 +33,6 @@
 #include <vector>
 #include <array>
 #include <algorithm>
-#include "spmv_seg.cu"
 #include <cuda_fp16.h>
 
 namespace chrono = std::chrono;
@@ -85,22 +84,6 @@ __device__ void collect_res_gpu(float *input)
     __syncthreads();
 }
 
-__device__ int binary_search_element(const int elem, const int *arr, int low, int high){
-    int mid;
-    while( low != high ){
-        mid = (low + high)/2;
-        if (elem == arr[mid])
-        return mid;
-
-        else if (elem > arr[mid])   // elem is on the right side
-            low = mid + 1;
-
-        else                        // elem is on the left side
-            high = mid - 1;
-    }
-    return -1; //not found
-}
-
 /**
  * @brief Parallel GPU version of matrix-vector multiplication, uses a grid-stride loop to perform the dot product.
  * 
@@ -109,7 +92,7 @@ __device__ int binary_search_element(const int elem, const int *arr, int low, in
  * @param val matrix values (COO format matrix - vector)
  * @param vec vector
  * @param result vector for result of the multiplication
- * @param N vector dimension
+ * @param N vectors dimension
  */
 __global__ void spmv_coo(const int *x, const int *y, const double *val, const double *vec, double *result, int N) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += blockDim.x * gridDim.x) {
@@ -140,19 +123,20 @@ __global__ void compute_dangling_factor_gpu(const int *a, const double *b, const
  * @param result pointer to the dangling factor (where to place the result of the function)
  */
 __global__ void compute_dangling_factor_gpu_reduction(const int *a, const double *b, const int N, float *result){
-    // using a share temp_result might speed up but we have problems in sync. the blocks
     extern __shared__ float temp[];
-    //half a_h, b_h;
+
     temp[threadIdx.x]=0.0;
     __syncthreads();
 
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
+
     if (idx < N) {
         temp[threadIdx.x] = (float)a[idx] * (float)b[idx];
     }
     __syncthreads();
 
     collect_res_gpu(temp);
+
     if (threadIdx.x == 0) {
         atomicAdd(result, temp[0]);
     }
@@ -202,8 +186,9 @@ __global__ void euclidean_distance_gpu(const double *x, const double *y, const i
  * @param N dimension of the vectors
  * @param result pointer to the computed distance result
  */
-__global__ void euclidean_distance_gpu_reduction(const double* x , const double* y , const int N, double* result/*, bool *excluded_pages*/) {
+__global__ void euclidean_distance_gpu_reduction(const double* x , const double* y , const int N, double* result) {
     extern __shared__ float temp[];
+
     temp[threadIdx.x]=0;
     __syncthreads();
     
@@ -217,40 +202,12 @@ __global__ void euclidean_distance_gpu_reduction(const double* x , const double*
     __syncthreads();
     
     collect_res_gpu(temp);
+
     if (threadIdx.x == 0) {
         atomicAdd(result, temp[0]);
     }
 }
 
-__global__ void spmv_coo_1(const int *x, const int *y, const double *val, const double *vec, double *result, const int N, const int res_size, int *shrinked_x){
-    extern __shared__ int s[]; //must be initialized with N elements from the caller
-
-    int *temp_idx = s;
-    double *temp_res = (double*)&temp_idx[res_size];
-    //int *last_idx = (int*)&temp_res[res_size];
-    int binary_search_res;
-
-
-    for (int i = threadIdx.x, j = blockIdx.x * blockDim.x + threadIdx.x; i < res_size; i += blockDim.x, j += blockDim.x * gridDim.x){ 
-        temp_res[i] = 0.0;
-        temp_idx[i] =shrinked_x[j];
-    }
-
-    __syncthreads();
-
-    // Uses a grid-stride loop to perform dot product
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += blockDim.x * gridDim.x) {
-        binary_search_res = binary_search_element(x[i], temp_idx, 0, res_size-1);
-        atomicAdd_block(temp_res + binary_search_res, (val[i] * vec[y[i]])); //only thread-safe, not block-safe
-    }
-
-    __syncthreads();
-    //riassamble all the partial results: the speedup should be that we're doing num_blocks*V atomicAdd() instead of num_blocks*E atomicAdd()
-    for(int i=threadIdx.x; i < res_size; i += blockDim.x){
-        atomicAdd(&result[temp_idx[i]], temp_res[i]);
-    }
-
-}
 
 //////////////////////////////
 //////////////////////////////
@@ -363,7 +320,7 @@ void PersonalizedPageRank::init() {
     //assumption: E > V
     for(int i=0; i<E; i++){
         //compute in_degree for each page: if page i not it x[i] --> in_degree[i] = 0
-        if(x[i] != last_idx){
+        while(x[i] != last_idx){
             if(last_idx >= 0){
                 in_degree[last_idx].first = last_idx_qty;
                 in_degree[last_idx].second = last_idx;
@@ -372,11 +329,12 @@ void PersonalizedPageRank::init() {
             last_idx++;
             last_idx_qty = (x[i] != last_idx) ? 0 : 1;
 
-        }else{
-            last_idx_qty++;
         }
+
+        last_idx_qty++;
     }
-    in_degree[last_idx].first = last_idx_qty; // finish writing the qty for the last page
+     // finish writing the qty for the last page
+    in_degree[last_idx].first = last_idx_qty;
     in_degree[last_idx].second = last_idx;
 
     while(last_idx < V){
@@ -396,18 +354,16 @@ void PersonalizedPageRank::init() {
 
 
     int precise_vertex_qty = (int)(V * heuristic_precision);
-    std::cout << "Precision: " << heuristic_precision << ", #precise vertex: " << precise_vertex_qty << std::endl;
 
-    //excluded_pages_cpu.resize(V);
     excluded_pages_cpu = (bool*)malloc(sizeof(bool) * V);
   
-    //std::cout << "Excluded pages:" << std::endl;
     for(int i=0; i<V; i++){
         excluded_pages_cpu[in_degree[i].second] = (i< precise_vertex_qty && in_degree[i].first != 0) ? false : true;
     }
 
     num_effective_vertex = std::count(excluded_pages_cpu, &excluded_pages_cpu[V-1], false);
 }
+
 
 // Reset the state of the computation after every iteration.
 // Reset the result, and transfer data to the GPU if necessary;
@@ -458,7 +414,7 @@ void PersonalizedPageRank::personalized_pagerank_0(int iter){
 
     double *temp;
     float dangling_factor_val;
-    double *err = (double *) malloc(sizeof(double)); 
+    double err; 
 
     int number_of_iterations = 0;
     bool conv = false;
@@ -482,9 +438,9 @@ void PersonalizedPageRank::personalized_pagerank_0(int iter){
         euclidean_distance_gpu<<<blocksPerGrid, threadsPerBlock>>>(pr_gpu, gpu_result, V, gpu_err);
         CHECK_KERNELCALL();
 
-        cudaMemcpy(err, gpu_err, sizeof(double), cudaMemcpyDeviceToHost);
-        *err = std::sqrt((double) *err);
-        conv = *err <= convergence_threshold;
+        cudaMemcpy(&err, gpu_err, sizeof(double), cudaMemcpyDeviceToHost);
+        err = std::sqrt((double) err);
+        conv = err <= convergence_threshold;
 
         temp = pr_gpu;
         pr_gpu = gpu_result;
@@ -522,7 +478,7 @@ void PersonalizedPageRank::personalized_pagerank_1(int iter){
 
     double *temp;
     float dangling_factor_val;
-    double *err = (double *) malloc(sizeof(double));   // convergence error
+    double err;   // convergence error
 
     cudaStream_t spmv_stream, dangling_factor_stream;
     cudaStreamCreate(&spmv_stream);
@@ -548,13 +504,14 @@ void PersonalizedPageRank::personalized_pagerank_1(int iter){
         CHECK(cudaMemsetAsync(dangling_factor_gpu, 0.0, sizeof(float), dangling_factor_stream));  // asynchronously reset the dangling factor on the GPU
         
         // Check convergence
-        euclidean_distance_gpu_reduction<<<blocksPerGrid, threadsPerBlock, blockSize * sizeof(float)>>>(pr_gpu, gpu_result, V, gpu_err/*, excluded_pages_gpu*/);
+        euclidean_distance_gpu_reduction<<<blocksPerGrid, threadsPerBlock, blockSize * sizeof(float)>>>(pr_gpu, gpu_result, V, gpu_err);
         CHECK_KERNELCALL();
 
-        cudaMemcpy(err, gpu_err, sizeof(double), cudaMemcpyDeviceToHost);
-        *err = std::sqrt((double) *err);
-        conv = *err <= convergence_threshold;
+        cudaMemcpy(&err, gpu_err, sizeof(double), cudaMemcpyDeviceToHost);
+        err = std::sqrt((double)err);
+        conv = err <= convergence_threshold;
 
+        // switch pr_gpu with gpu_result to avoid copying results computed in this iteration back in pr_gpu vector
         temp = pr_gpu;
         pr_gpu = gpu_result;
         gpu_result = temp; 
@@ -584,12 +541,13 @@ void PersonalizedPageRank::execute(int iter) {
     switch (implementation)
     {
     case 0:
-        personalized_pagerank_0(iter); // first implementation
+        personalized_pagerank_0(iter); // basic implementation
         break;
     case 1:
-        personalized_pagerank_1(iter); // second implementation
+        personalized_pagerank_1(iter); // optimized implementation
         break;
     default:
+        std::cout << "No implementation selected: choose either 0 (basic) or 1 (optimized)" << std::endl;
         break;
     }
 }
